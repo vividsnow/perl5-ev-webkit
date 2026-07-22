@@ -22,12 +22,38 @@ use EV; use EV::WebKit; use IO::Socket::INET; use Time::HiRes qw(time);
 # so it does not run there. It is still worth keeping and worth running by
 # hand after touching navigation.
 #
-# Known open issue (do not "fix" by loosening): the reload-vs-go block can
+# Known open issue (do not "fix" by loosening). The reload-vs-go block can
 # legitimately fail when the web process commits the superseded mock load
-# before it processes the reload. The load-changed handler then stamps that
-# committed uri onto a pending belonging to a DIFFERENT navigation
-# generation, so the stray 'finished' matches on identity and is judged
-# genuine. That is a real ordering race in the module, not a test artifact.
+# before it processes the reload -- a real ordering race in the module, not a
+# test artifact. Analysed 2026-07-23; there are TWO paths to the same false
+# success, and closing only one does not fix it:
+#
+#   Path 1 (mechanism 1, the committed-uri gate). The load-changed
+#   started/committed branch stamps $p->[5] onto whatever is CURRENTLY
+#   pending, with no check that the event belongs to it -- unlike finished
+#   and load-failed, which both gate on {_superseded}. A superseded nav's
+#   belated 'committed' therefore stamps the reload pending's $p->[5] with
+#   the superseded uri, and that nav's 'finished' then matches on identity.
+#   This half IS locally fixable: gate the started/committed stamp on
+#   {_superseded} too, so a tail signal for a torn-down nav is not stamped.
+#
+#   Path 2 (mechanism 2, the superseded-uri filter). Even with NO commit,
+#   _finished_is_stray resolves the current pending as success when the
+#   finished's uri coincides with a superseded identity ("coincide ->
+#   resolve"). In this race get_uri is still the superseded mock uri at
+#   finished time, so this fires on its own. Flipping it to "coincide ->
+#   stray" would close the race -- BUT the R11 report
+#   (.superpowers/sdd/review-loop-r11-fix-report.md) states that branch
+#   keeps a bfcache no-commit restore working, a case R11 could NOT trigger
+#   live and verified only by inspection. It cannot be reproduced in this
+#   environment either, so the flip cannot be shown safe.
+#
+# Because path 2 needs an unverifiable change to an 11-round-hardened state
+# machine, and this test is already quarantined here, the module is left as
+# the documented irreducible blind spot ('finished' carries no nav identity).
+# A session that CAN reproduce the bfcache no-commit case should revisit both
+# paths together. Do not ship a partial (path-1-only) fix: it muddies the
+# water without closing the race.
 
 # Regression coverage for R11: the load-changed 'finished' success path
 # ($self->_finish_nav(undef) if $ev eq 'finished') had NO identity check at
