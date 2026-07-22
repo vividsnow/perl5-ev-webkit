@@ -1,0 +1,14 @@
+/blib/
+/Makefile
+/Makefile.old
+/pm_to_blib
+/MYMETA.*
+*.bak
+/share/
+*.so
+/.superpowers/
+.tmp/
+
+# Internal adversarial-review findings: kept locally, never published --
+# they enumerate live detection vectors against this module.
+/docs/superpowers/fingerprint-review-round*.md

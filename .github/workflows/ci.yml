@@ -1,0 +1,55 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb cpanminus \
+            gir1.2-gtk-4.0 gir1.2-javascriptcoregtk-6.0 gir1.2-soup-3.0 \
+            libwebkitgtk-6.0-4 gir1.2-webkit-6.0 \
+            libgirepository1.0-dev
+
+      - name: cpan deps
+        run: |
+          # The runner's perl tree is not writable, so cpanm falls back to
+          # ~/perl5 (a local::lib layout) -- and still exits 0. That directory is
+          # NOT in the default @INC, so every later `perl Makefile.PL` fails to
+          # find what we just "successfully installed". Put it on PERL5LIB for
+          # this step and, via $GITHUB_ENV, for the build and test steps too.
+          export PERL5LIB="$HOME/perl5/lib/perl5${PERL5LIB:+:$PERL5LIB}"
+          echo "PERL5LIB=$PERL5LIB" >> "$GITHUB_ENV"
+          # CONFIGURE_REQUIRES first: `cpanm --installdeps .` has to RUN
+          # Makefile.PL to discover the deps, and Makefile.PL cannot even compile
+          # without File::ShareDir::Install, so installdeps alone cannot bootstrap.
+          cpanm --notest File::ShareDir::Install File::ShareDir
+          cpanm --notest --installdeps . \
+            || cpanm --notest EV EV::Glib Glib Glib::Object::Introspection Glib::IO Cpanel::JSON::XS
+
+      - name: build
+        run: |
+          perl Makefile.PL
+          make
+
+      - name: sanity check (typelibs resolve without a display)
+        run: perl -Mblib -MEV::WebKit -e 'die "EV::WebKit not available\n" unless EV::WebKit::available'
+
+      # Quoted: an unquoted colon-space in a YAML scalar starts a mapping, which
+      # made this whole workflow unparseable and every run fail in 0s.
+      - name: "test (bring-your-own-display: must run under xvfb-run, plain make test would skip_all)"
+        # A GitHub runner denies the network-namespace setup WebKit's bubblewrap
+        # sandbox performs ("bwrap: loopback: Failed RTM_NEWADDR"), so the web
+        # process dies and every API call aborts on lost credentials -- 55 of 64
+        # test programs died with SIGABRT before this. There is no a11y bus
+        # either, and dmabuf/compositing has nothing to talk to under llvmpipe.
+        env:
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+          GTK_A11Y: none
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+        run: xvfb-run -a make test
