@@ -1133,7 +1133,23 @@ static gdouble g_pd(void*a,void*b){(void)a;(void)b; return P.pd;}
  * side instead would make `languages` a DATA property where every real browser
  * has an accessor, which is a louder tell than the one being fixed. A leak and
  * a worse tell are both worse than the gap, so the gap stays, documented in the
- * Ceiling POD. */
+ * Ceiling POD.
+ *
+ * A SECOND route was then tried and abandoned, recorded so nobody spends
+ * another day on it: root the array at the VM level rather than the GObject
+ * level, holding no strong JSCValue at all -- a JSCWeakValue plus a
+ * JSValueProtect'd JSValueRef, reaching the raw context through
+ * webkit_frame_get_js_context. The lifetime reasoning survives scrutiny in
+ * isolation: the context is never referenced, freeing is safe in either order,
+ * and the protect root is genuinely required (without it GC collects the
+ * array). It still does not work. On WebCore's own VM inside the web process,
+ * JSGlobalContextCreateInGroup crashes, and so does JSValueMakeString on the
+ * context window-object-cleared hands you -- both take the whole web process
+ * down, not merely the getter. Some 200 lines of raw JSC C API, crashing twice,
+ * to close one obscure identity check is a bad trade for a module whose point
+ * is surviving long automation runs. If anyone revisits this, start by
+ * establishing what locking the JSC C API requires on that context: that is the
+ * part still unexplained. */
 static char **g_langs (void*a,void*b){(void)a;(void)b; return g_strdupv (P.languages);}
 
 static void def_str  (JSCValue *o, const char *n, GCallback g) {
