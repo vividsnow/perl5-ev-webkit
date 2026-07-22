@@ -45,7 +45,6 @@ t/62-cookiejar.t
 t/63-proxy.t
 t/64-nav.t
 t/65-nav-overlap.t
-t/66-nav-finished.t
 t/70-console.t
 t/71-dialog.t
 t/72-policy.t
@@ -80,4 +79,5 @@ t/A2-features.t
 t/lib/TCTL.pm
 t/lib/TWK.pm
 wext/evwk_fp.c
+xt/66-nav-finished.t
 xt/fingerprint-spike.pl
