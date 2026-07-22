@@ -738,4 +738,43 @@ JS
        'closing precedes close, and an onclose re-set after null runs AFTER a listener added meanwhile');
 }
 
+# --- RTCSessionDescription: `type` is a REQUIRED WebIDL member of
+# RTCSessionDescriptionInit, so a spec-compliant browser throws during
+# dictionary conversion when it is absent. Verified against the W3C WebRTC IDL
+# (`required RTCSdpType type`) and MDN. RTCIceCandidate has no such required
+# member and must stay lenient. ---
+{
+    my $b = EV::WebKit->new(window => [200,150], fingerprint => 'windows-chrome');
+    $b->mock_scheme('sd', sub { ('<html><body></body></html>','text/html') });
+    my $out;
+    $b->go('sd://host/p', sub {
+        $b->script(<<'JS', sub { $out = $_[0]; EV::break });
+          const res = {ran:1};
+          if (!('RTCSessionDescription' in window)) return JSON.stringify(res);
+          try { new RTCSessionDescription({}); res.empty = 'no-throw'; } catch(e){ res.empty = e.name; }
+          try { new RTCSessionDescription();   res.noarg = 'no-throw'; } catch(e){ res.noarg = e.name; }
+          try { const d = new RTCSessionDescription({type:'offer'});
+                res.okType = d.type; res.okSdp = d.sdp; } catch(e){ res.okType = 'THREW '+e.name; }
+          try { const d = new RTCSessionDescription({type:'answer', sdp:'v=0'});
+                res.full = d.type + '/' + d.sdp; } catch(e){ res.full = 'THREW '+e.name; }
+          // untouched: RTCIceCandidate has no required member
+          try { const c = new RTCIceCandidate({}); res.ice = 'ok'; res.iceCand = c.candidate; }
+          catch(e){ res.ice = 'THREW '+e.name; }
+          return JSON.stringify(res);
+JS
+    });
+    TWK::run_with_timeout(20);
+    $b->quit;
+    require Cpanel::JSON::XS;
+    my $r = Cpanel::JSON::XS::decode_json($out // '{}');
+    ok($r->{ran}, 'RTCSessionDescription probe ran') or diag('probe returned nothing');
+    is($r->{empty}, 'TypeError', 'new RTCSessionDescription({}) throws (required member type absent)');
+    is($r->{noarg}, 'TypeError', 'new RTCSessionDescription() throws (required member type absent)');
+    is($r->{okType}, 'offer', 'a valid {type} constructs and reflects type');
+    is($r->{okSdp},  '',      'sdp defaults to the empty string');
+    is($r->{full}, 'answer/v=0', '{type, sdp} both round-trip');
+    is($r->{ice},  'ok',      'RTCIceCandidate({}) stays lenient (no required member) -- not over-restricted');
+    is($r->{iceCand}, '',     'RTCIceCandidate candidate defaults to the empty string');
+}
+
 done_testing;

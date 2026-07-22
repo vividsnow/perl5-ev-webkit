@@ -947,7 +947,16 @@ static const char *FEATURES_JS =
     "      var C=function(init){"
     "        if(!(this instanceof C)) throw new TypeError(\"Failed to construct '\"+name+\"': Please use the 'new' operator.\");"
     "        init=init||{}; var v={};"
-    "        fields.forEach(function(f){ v[f[0]]=(init[f[0]]!==undefined?init[f[0]]:f[1]); });"
+    /* A field flagged required (f[2]) is a WebIDL `required` member:
+     * RTCSessionDescriptionInit.type is one, so a real browser throws during
+     * dictionary conversion when it is absent -- new RTCSessionDescription({})
+     * and new RTCSessionDescription() are both a TypeError, not an object
+     * carrying type ''. The message follows Blink's standard required-member
+     * template. */
+    "        fields.forEach(function(f){"
+    "          if(f[2] && init[f[0]]===undefined) throw new TypeError(\"Failed to construct '\"+name"
+    "            +\"': Failed to read the '\"+f[0]+\"' property from '\"+name+\"Init': Required member is undefined.\");"
+    "          v[f[0]]=(init[f[0]]!==undefined?init[f[0]]:f[1]); });"
     "        dictVals.set(this,v); };"
     "      fields.forEach(function(f){"
     "        Object.defineProperty(C.prototype,f[0],{enumerable:true,configurable:true,"
@@ -959,7 +968,7 @@ static const char *FEATURES_JS =
     "      try{ Object.defineProperty(C,'prototype',{writable:false}); }catch(e){}"
     "      if(!(name in window)) Object.defineProperty(window,name,{value:C,writable:true,enumerable:false,configurable:true});"
     "      return C; };"
-    "    mkDict('RTCSessionDescription',[['type',''],['sdp','']]);"
+    "    mkDict('RTCSessionDescription',[['type','',1],['sdp','']]);"   /* type is a REQUIRED WebIDL member */
     "    mkDict('RTCIceCandidate',[['candidate',''],['sdpMid',null],['sdpMLineIndex',null],['usernameFragment',null]]);"
     "    var RPC=class RTCPeerConnection extends EventTarget {"
     "      constructor(){ super(); }"

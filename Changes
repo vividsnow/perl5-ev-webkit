@@ -1,6 +1,7 @@
 Revision history for EV-WebKit
 
 {{$NEXT}}
+        - fingerprint: new RTCSessionDescription({}) and new RTCSessionDescription() now throw a TypeError, as a real browser does. `type` is a REQUIRED member of RTCSessionDescriptionInit in the WebIDL (verified against the W3C WebRTC spec and MDN), so a spec-compliant engine rejects a missing one during dictionary conversion; the stub previously constructed an object carrying type ''. A valid {type} (optionally with sdp) still constructs and round-trips, and RTCIceCandidate -- which has no required member -- stays lenient.
         - test: move the navigation-finished RACE regressions from t/ to xt/, so they no longer run under `make test`. Two of their assertions are lower bounds on elapsed time, because a stray 'finished' resolves in ~10-60ms while the real outcome arrives after a deliberate 150ms server delay -- the time gap is the only thing distinguishing "resolved by my own outcome" from "resolved by somebody else's stray event", so it cannot be loosened without deleting the guard. The consequence is that a loaded machine fails it for reasons unrelated to the code (it went red once on a GitHub runner and green on the next identical run), and a verdict that depends on winning a 150ms IPC race does not belong in the suite a user or a CPAN tester runs. Run it deliberately: `xvfb-run -a prove -Ilib -b xt/66-nav-finished.t`. Default suite is now 63 files / 1468 tests.
 
 0.03  2026-07-21
