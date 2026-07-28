@@ -172,6 +172,7 @@ JS
 my %KNOWN_NEW = map { $_ => 1 } qw(
     timeout window display
     on_load on_error on_close on_navigate on_console on_dialog on_policy
+    on_file_chooser on_download
     data_dir cache_dir ephemeral cookie_jar jar_format
     proxy user_agent devtools title chrome
     fingerprint network_fingerprint seed
@@ -682,6 +683,101 @@ sub new {
         return 1;   # handled
     });
 
+    # File upload. Without a handler this stays UNhandled (return 0) so WebKit
+    # runs its own native GTK file chooser exactly as before -- connecting the
+    # signal must not change what an interactive user sees. With a handler, the
+    # page's <input type=file> can be driven headlessly, which is otherwise
+    # impossible: the value of a file input cannot be set from JavaScript.
+    $self->{on_file_chooser} = $o{on_file_chooser};
+    $view->signal_connect('run-file-chooser' => sub {
+        my (undef, $req) = @_;
+        local $IN_DISPATCH = 1;          # runs nested in WebKit's dispatch frame -- see quit
+        my $self = $wself or return 0;   # gone: let WebKit do its default
+        return 0 if $self->{_dead};
+        my $cb = $self->{on_file_chooser} or return 0;   # unhandled -> native dialog
+        my $fc = EV::WebKit::FileChooser->_new($req);
+        # Fail CLOSED, like on_policy: a handler that dies must not leave the
+        # page waiting on a chooser that never resolves. Cancel and report
+        # handled, so the upload is refused rather than hanging the form.
+        unless (eval { $cb->($fc); 1 }) {
+            warn "EV::WebKit: on_file_chooser callback died (cancelling the chooser): $@";
+            eval { $req->cancel } unless $fc->{done};
+            return 1;
+        }
+        # A handler that decided nothing gets the same treatment: an unanswered
+        # request is a hung page, so make the refusal explicit.
+        eval { $req->cancel } unless $fc->{done};
+        return 1;
+    });
+
+    # Downloads. WebKit asks for a destination via the download's own
+    # decide-destination; nothing is written until we answer, so a download with
+    # no handler is cancelled rather than landing somewhere unasked.
+    $self->{on_download} = $o{on_download};
+    $session->signal_connect('download-started' => sub {
+        my (undef, $dl) = @_;
+        local $IN_DISPATCH = 1;
+        my $self = $wself or return;
+        return if $self->{_dead};
+        my $d = EV::WebKit::Download->_new($self, $dl);
+        # Keep the wrapper alive for the download's lifetime: the signal
+        # closures below are the only thing referencing it, and its per-download
+        # callbacks live on it. Dropped in _finish.
+        $self->{_downloads}{$d->{seq}} = $d;
+        # Claim the destination/callback parked by download(), if this is one of
+        # ours. A page-initiated download matches nothing and falls through to
+        # on_download below, exactly as before.
+        if (defined(my $u = $d->uri)) {
+            if (my $q = $self->{_dl_want}{$u}) {
+                if (my $want = shift @$q) {
+                    delete $self->{_dl_want}{$u} unless @$q;
+                    $d->save_to($want->{dest});
+                    $d->on_finish($want->{cb}) if $want->{cb};
+                }
+            }
+        }
+        $dl->signal_connect('decide-destination' => sub {
+            my (undef, $suggested) = @_;
+            my $s = $wself or return 0;
+            $d->{suggested} = $suggested;
+            # dest may have been chosen up-front by on_download (below); if not,
+            # ask the handler now that the suggested name is known.
+            unless (defined $d->{dest}) {
+                my $cb = $s->{on_download};
+                if ($cb) {
+                    unless (eval { $cb->($d); 1 }) {
+                        warn "EV::WebKit: on_download callback died (cancelling the download): $@";
+                    }
+                }
+            }
+            unless (defined $d->{dest}) {
+                # Nobody named a destination. Cancelling is the only safe
+                # answer: WebKit's own default would write into the user's
+                # Downloads directory, which an automation run must not do
+                # behind the caller's back.
+                eval { $dl->cancel };
+                $d->_finish(undef, 'no destination set (call save_to in on_download)');
+                return 1;
+            }
+            $dl->set_allow_overwrite(1) if $d->{overwrite};
+            $dl->set_destination($d->{dest});
+            return 1;   # handled -- we set it
+        });
+        $dl->signal_connect(finished => sub {
+            my $s = $wself or return;
+            # 'finished' also fires after a cancel; _finish dedupes, so the
+            # cancel path's error is the one that reaches the caller.
+            $d->_finish($d->{dest}, undef);
+        });
+        $dl->signal_connect(failed => sub {
+            my (undef, $gerr) = @_;
+            my $s = $wself or return;
+            my $msg = eval { $gerr->message } || 'download failed';
+            $d->_finish(undef, $msg);
+        });
+        return;
+    });
+
     return $self;
 }
 
@@ -842,7 +938,8 @@ sub _remove_all_user {
 #     $b->on_console(sub { $prev->(@_) if $prev; ...also mine... });
 #
 # through the public API, instead of reaching into the object.
-for my $h (qw/on_load on_error on_close on_navigate on_console on_dialog on_policy/) {
+for my $h (qw/on_load on_error on_close on_navigate on_console on_dialog on_policy
+              on_file_chooser on_download/) {
     no strict 'refs';
     *{__PACKAGE__ . "::$h"} = sub {
         my $self = shift;
@@ -1691,6 +1788,38 @@ sub wait_for {
     return $self;
 }
 
+# Fetch a URI straight to disk, without navigating to it. Useful on its own,
+# and the reliable way to exercise the download path: a page-initiated download
+# depends on the server sending something WebKit refuses to display, whereas
+# this always produces one.
+sub download {
+    my ($self, $uri, $path, $cb) = @_;
+    Carp::croak('download: callback must be a code reference') if defined $cb && ref $cb ne 'CODE';
+    Carp::croak('download: a destination path is required') if !defined $path || ref $path || !length $path;
+    if (!defined $uri || !length $uri) {
+        $self->_defer_final($cb, undef, 'download: uri required') if $cb;
+        return $self;
+    }
+    if ($self->{_dead} || !$self->{view}) {
+        $self->_defer_final($cb, undef, 'browser closed') if $cb;
+        return $self;
+    }
+    # The destination and callback belong to THIS request, but they can only be
+    # applied once WebKit raises download-started. Park them under the uri we
+    # are about to ask for; the handler claims the matching entry (and a
+    # page-initiated download, which matches nothing, still reaches
+    # on_download). A list per uri, so two downloads of the same uri do not
+    # clobber each other.
+    push @{ $self->{_dl_want}{$uri} }, { dest => $path, cb => $cb };
+    eval { $self->{view}->download_uri($uri); 1 } or do {
+        my $err = $@ || 'download failed to start';
+        pop @{ $self->{_dl_want}{$uri} };
+        delete $self->{_dl_want}{$uri} unless @{ $self->{_dl_want}{$uri} };
+        $self->_defer_final($cb, undef, "download: $err") if $cb;
+    };
+    return $self;
+}
+
 sub screenshot {
     my $self = shift;
     my $cb   = pop;
@@ -2366,6 +2495,25 @@ sub _teardown {
         $p->[1]->stop if $p->[1];
         push @owed, $p->[0] if $p->[0];
     }
+    # In-flight downloads: cancel them and collect their on_finish callbacks the
+    # same way. A download that is still running when the browser closes would
+    # otherwise leave its caller waiting for a completion signal that can no
+    # longer arrive -- the exact silent hang {_ops} exists to prevent. Take the
+    # callbacks directly (not via _finish, which routes through _defer and would
+    # be dead-gated by now) and mark each wrapper done so a late native signal
+    # cannot deliver twice.
+    # _flush already invokes each owed callback as ->(undef, 'browser closed'),
+    # which is exactly on_finish's ($path, $err) signature, so the raw callback
+    # goes straight in.
+    for my $d (values %{ delete $self->{_downloads} || {} }) {
+        eval { $d->{dl}->cancel };
+        $d->{done} = 1;                                   # a late native signal now finds nothing to deliver
+        push @owed, delete $d->{on_finish} if $d->{on_finish};
+    }
+    # ...and requests parked by download() that never reached download-started.
+    for my $q (values %{ delete $self->{_dl_want} || {} }) {
+        push @owed, grep { defined } map { $_->{cb} } @$q;
+    }
     # Still inside a WebKit dispatch frame? Then these callbacks must not run
     # HERE. quit() defers the whole teardown for exactly that reason -- but it
     # cannot when DESTROY brought us here (a strong ref to a refcount-0 object
@@ -2469,6 +2617,116 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
         my $t = $d->get_dialog_type;
         $d->confirm_set_confirmed(0) if _is_confirm($t);
         $s->{answered} = 1;
+    }
+}
+
+{
+    package EV::WebKit::FileChooser;
+    # lightweight wrapper around a WebKitFileChooserRequest, valid only for the
+    # duration of the run-file-chooser handler that receives it.
+    sub _new { bless { r => $_[1] }, $_[0] }
+
+    # What the <input type=file> asked for. mime_types is the accept= list (an
+    # empty list means anything); multiple tells you whether more than one file
+    # is allowed, so a handler can avoid offering files WebKit will discard.
+    sub mime_types { my $m = eval { $_[0]{r}->get_mime_types }; ref $m eq 'ARRAY' ? @$m : () }
+    sub multiple   { $_[0]{r}->get_select_multiple ? 1 : 0 }
+    sub selected   { my $f = eval { $_[0]{r}->get_selected_files }; ref $f eq 'ARRAY' ? @$f : () }
+
+    sub select {
+        my ($s, @files) = @_;
+        Carp::croak('select: at least one file path is required') unless @files;
+        Carp::croak('select: this chooser accepts a single file only')
+            if @files > 1 && !$s->multiple;
+        for my $f (@files) {
+            Carp::croak('select: file paths must be plain strings') if !defined $f || ref $f;
+            # WebKit hands the page whatever we pass without checking, and a
+            # missing file becomes an unreadable entry the form then submits as
+            # empty -- fail here, where the caller can see why.
+            Carp::croak("select: no such file: $f") unless -e $f;
+        }
+        $s->{r}->select_files(\@files);
+        $s->{done} = 1;
+        return $s;
+    }
+
+    sub cancel { $_[0]{r}->cancel; $_[0]{done} = 1; return $_[0] }
+}
+
+{
+    package EV::WebKit::Download;
+    # A download in progress. Unlike Dialog/FileChooser this OUTLIVES the signal
+    # that created it: WebKit reports progress and completion later, so the
+    # object is retained by the browser until it finishes or fails.
+    my $SEQ = 0;
+    sub _new {
+        my ($class, $browser, $dl) = @_;
+        Scalar::Util::weaken(my $b = $browser);   # the browser owns us; do not own it back
+        return bless { b => $b, dl => $dl, seq => ++$SEQ, overwrite => 0 }, $class;
+    }
+
+    sub uri       { eval { $_[0]{dl}->get_request->get_uri } }
+    sub suggested { $_[0]{suggested} }          # only known once decide-destination has fired
+    sub destination { $_[0]{dest} }
+    sub progress  { eval { $_[0]{dl}->get_estimated_progress } // 0 }
+    sub received  { eval { $_[0]{dl}->get_received_data_length } // 0 }
+
+    # Choose where this download lands. Called from on_download; without it the
+    # download is cancelled rather than written to WebKit's default directory.
+    sub save_to {
+        my ($s, $path, %o) = @_;
+        Carp::croak('save_to: a destination path is required') if !defined $path || ref $path || !length $path;
+        # A PLAIN FILESYSTEM PATH, never a file:// URI. WebKitGTK 6.0 changed
+        # webkit_download_set_destination to take a path (2.x took a URI), and
+        # handing it a URI does not fail -- the download simply stalls forever,
+        # emitting neither 'finished' nor 'failed', so the caller waits on a
+        # callback that can never arrive. Accept a file:// URI from the caller
+        # and strip it, rather than passing that trap along.
+        $path =~ s{^file://}{};
+        $s->{dest}      = $path;
+        $s->{overwrite} = $o{overwrite} ? 1 : 0;
+        return $s;
+    }
+
+    sub on_finish {
+        my ($s, $cb) = @_;
+        Carp::croak('on_finish: expected a code reference') if defined $cb && ref $cb ne 'CODE';
+        $s->{on_finish} = $cb;
+        # A download that already finished (or failed) before the caller got
+        # round to registering must still deliver, or the callback is lost.
+        $s->_deliver if $s->{done};
+        return $s;
+    }
+
+    sub cancel { eval { $_[0]{dl}->cancel }; return $_[0] }
+
+    # Called at most once per download; later duplicate signals are ignored so a
+    # cancel's error is not overwritten by the 'finished' that follows it.
+    sub _finish {
+        my ($s, $path, $err) = @_;
+        return if $s->{done};
+        $s->{done} = 1;
+        $s->{path} = $path;      # already a plain path -- see save_to
+        $s->{err}  = $err;
+        $s->_deliver;
+        # Release the browser's retention of this wrapper; the callback above
+        # has already been handed everything it needs.
+        my $b = $s->{b};
+        delete $b->{_downloads}{ $s->{seq} } if $b;
+        return;
+    }
+
+    sub _deliver {
+        my ($s) = @_;
+        my $cb = delete $s->{on_finish} or return;
+        my $b  = $s->{b};
+        my ($path, $err) = ($s->{path}, $s->{err});
+        # Deferred like every other callback: _finish runs inside WebKit's own
+        # signal dispatch, and calling user code (which may call EV::break) from
+        # there is the documented lifecycle wedge.
+        if ($b) { $b->_defer($cb, $path, $err) }
+        else    { eval { $cb->($path, $err); 1 } or warn "EV::WebKit: download on_finish died: $@" }
+        return;
     }
 }
 
@@ -3077,6 +3335,69 @@ resolving.
 
 On timeout, C<$el> is C<undef> and C<$err eq 'timeout'>. Returns C<$b>.
 
+=head2 Downloads and file upload
+
+Fetch resources to disk, and drive file inputs.
+
+=head2 download
+
+    $b->download($uri, $path, sub { my ($path, $err) = @_; ... });
+
+Fetches C<$uri> straight to C<$path> without navigating to it. C<$path> is a
+plain filesystem path. On success the callback receives that path; on failure,
+C<undef> and an error string. Returns C<$b>.
+
+Note that a custom scheme registered with C<mock_scheme> is B<not> reachable
+this way: C<mock_scheme> is registered on the web context, while downloads run
+on the network session, which has never heard of the scheme and reports
+C<"The URL can't be shown">. C<file://> URIs produce no download at all.
+
+A download still in flight when C<quit> is called resolves with
+C<'browser closed'>, like every other pending operation.
+
+=head2 C<< on_download => sub { my ($download) = @_ } >>
+
+Called when the B<page> starts a download (a link with C<download>, a response
+WebKit will not display). The handler must name a destination:
+
+    on_download => sub {
+        my ($d) = @_;
+        $d->save_to("/tmp/" . $d->suggested);
+        $d->on_finish(sub { my ($path, $err) = @_; ... });
+    }
+
+B<A download whose handler names no destination is cancelled>, deliberately:
+WebKit's own default writes into the user's Downloads directory, which an
+automation run must not do behind the caller's back. With no C<on_download> at
+all, every page-initiated download is cancelled.
+
+The object passed in offers C<uri>, C<suggested> (the server's suggested
+filename), C<destination>, C<progress>, C<received>, C<save_to($path,
+overwrite =E<gt> $bool)>, C<on_finish($cb)> and C<cancel>. It stays valid until
+the download finishes or fails, unlike the dialog and policy objects.
+
+=head2 C<< on_file_chooser => sub { my ($chooser) = @_ } >>
+
+Called when the page opens a file chooser -- a click on C<< <input type=file> >>,
+which is the only way to populate one, since a file input's value cannot be set
+from JavaScript:
+
+    on_file_chooser => sub { $_[0]->select('/tmp/photo.png') }
+
+The object offers C<mime_types> (the C<accept=> list), C<multiple>, C<selected>,
+C<select(@paths)> and C<cancel>. C<select> croaks on a path that does not exist,
+or on several paths when the input accepts only one -- WebKit itself would
+silently hand the page an unreadable entry.
+
+B<The selection is applied asynchronously.> Reading C<files.length> in the
+callback of the C<click> that opened the chooser still sees 0; it becomes
+correct a tick later. Poll for it (or wait) rather than reading once.
+
+Without an C<on_file_chooser> handler nothing changes: WebKit runs its own
+native GTK file chooser, exactly as before. A handler that dies, or that
+decides nothing, cancels the request rather than leaving the page waiting on a
+chooser that never resolves.
+
 =head2 Screenshots and PDF
 
 Capture the rendered page.
@@ -3602,6 +3923,20 @@ a page that could provoke a die (a URI that breaks the handler's own parsing,
 say) would otherwise walk straight through it, since an exception escaping
 the handler leaves WebKit to apply its own default -- allow. A handler that
 already called C<allow> or C<block> keeps that decision even if it then dies.
+
+=item C<< on_download => sub { my ($download) = @_ } >>
+
+Called when the page starts a download. The handler must name a destination
+with C<save_to> or the download is cancelled -- see L</"on_download"> under
+L</"Downloads and file upload"> for the object's full interface and the
+reasoning.
+
+=item C<< on_file_chooser => sub { my ($chooser) = @_ } >>
+
+Called when the page opens a file chooser, which is the only way to populate
+an C<< <input type=file> >>. Without this handler WebKit runs its own native
+chooser, unchanged. See L</"on_file_chooser"> under L</"Downloads and file
+upload">.
 
 =back
 
