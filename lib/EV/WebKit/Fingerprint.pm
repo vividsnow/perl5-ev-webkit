@@ -261,6 +261,14 @@ my %PRESET = (
         # Android Chrome has WebUSB + Web Bluetooth but NOT WebHID / Web Serial.
         features => [qw(connection storage battery usb bluetooth scheduling rtc)],
         mobile => 1,
+        # Chrome for Android had NO inline PDF viewer at 131, so it reports
+        # pdfViewerEnabled false and an EMPTY plugins/mimeTypes list, where every
+        # other preset (and WebKitGTK itself) reports true and the five plugin
+        # names the HTML spec hardcodes. Dates, because the margin is narrow:
+        # Chrome 131 for Android shipped 2024-11-06, the Android viewer first
+        # appeared behind a flag in 2024-12, and only became default-on in
+        # Chrome 135 (2025-04). So 131 predates it outright.
+        pdf_viewer => 0,
         ua_data => { platform => 'Android', platformVersion => '14.0.0', architecture => '', bitness => '', model => 'Pixel 8', uaFullVersion => '131.0.6778.86',
                      brands          => [ {brand=>'Google Chrome',version=>'131'},          {brand=>'Chromium',version=>'131'},          {brand=>'Not_A Brand',version=>'24'} ],
                      fullVersionList => [ {brand=>'Google Chrome',version=>'131.0.6778.86'}, {brand=>'Chromium',version=>'131.0.6778.86'}, {brand=>'Not_A Brand',version=>'24.0.0.0'} ] },
@@ -274,6 +282,7 @@ my %FIELD = (
     hardwareConcurrency => 'num', deviceMemory => 'num', maxTouchPoints => 'num',
     devicePixelRatio => 'num', screen => 'screen',
     mobile => 'bool', ua_data => 'uadata', webgl => 'webgl', features => 'features',
+    pdf_viewer => 'bool',
 );
 
 sub profiles { return sort keys %PRESET }
@@ -519,6 +528,11 @@ sub _coherence {
     # Which DOM feature-presence stub groups to install (each in-guarded in JS, so
     # a build that ships the real API keeps it). See FEATURES_JS in the extension.
     $c{features} = $p->{features} if $p->{features};
+    # Only emitted when the profile says there is NO inline PDF viewer, because
+    # that is the only case needing action: WebKitGTK already reports the
+    # viewer-present state (true + the five spec-hardcoded plugin names) that
+    # every other preset wants.
+    $c{no_pdf_viewer} = 1 if exists $p->{pdf_viewer} && !$p->{pdf_viewer};
     return %c ? \%c : undef;
 }
 

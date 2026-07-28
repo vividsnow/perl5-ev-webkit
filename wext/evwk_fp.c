@@ -774,6 +774,57 @@ static const char *COHERENCE_JS =
  * device access behind them, and like the other JS-installed layers they are
  * Function.prototype.toString.call-detectable (documented ceiling). Driven by
  * cfg.features, an array of group names chosen per profile in Fingerprint.pm. */
+/* navigator.plugins / mimeTypes / pdfViewerEnabled for a profile with NO inline
+ * PDF viewer -- currently only Chrome for Android, which had none at 131.
+ *
+ * The HTML spec hardcodes both states: a browser with inline PDF viewing reports
+ * pdfViewerEnabled true and five fixed plugin names, one without reports false
+ * and EMPTY lists. WebKitGTK reports the viewer-present state, so a Chrome 131
+ * Android profile contradicted itself in one property read.
+ *
+ * Faking the empty list is fiddly for one reason: PluginArray.prototype.length
+ * (and item/namedItem) BRAND-CHECK -- calling them on an Object.create(
+ * PluginArray.prototype) throws TypeError, so the obvious fake breaks on the
+ * first length read. Nor can length be shadowed as an own property: on a real
+ * PluginArray it lives on the prototype, and getOwnPropertyDescriptor would show
+ * the difference. So the prototype accessor itself is patched to answer for OUR
+ * one cached instance and delegate for everything else. length stays exactly
+ * where a real browser keeps it. */
+static const char *PLUGINS_JS =
+    "(function(){"
+    "  var C; try{ C=JSON.parse(window.__evwk_cfg); }catch(e){ return; }"
+    "  if(!C || !C.no_pdf_viewer) return;"
+    "  var mk=function(ctor){"
+    "    if(typeof ctor!=='function'||!ctor.prototype) return null;"
+    "    var inst=Object.create(ctor.prototype);"
+    /* Patch each brand-checking member once: answer the empty-list value for
+     * `inst`, delegate to the original for every real instance. */
+    "    ['length','item','namedItem'].forEach(function(k){"
+    "      var d=Object.getOwnPropertyDescriptor(ctor.prototype,k); if(!d) return;"
+    "      if(d.get){"
+    "        var og=d.get;"
+    "        Object.defineProperty(ctor.prototype,k,{enumerable:d.enumerable,configurable:true,"
+    "          get:function(){ return this===inst ? 0 : og.call(this); }});"
+    "      } else if(typeof d.value==='function'){"
+    "        var ov=d.value;"
+    "        Object.defineProperty(ctor.prototype,k,{enumerable:d.enumerable,configurable:true,"
+    "          writable:d.writable,"
+    "          value:function(){ return this===inst ? null : ov.apply(this,arguments); }});"
+    "      } });"
+    "    return inst; };"
+    "  var pa=mk(window.PluginArray), ma=mk(window.MimeTypeArray);"
+    /* Cache: a real browser returns the SAME object on every read, so minting a
+     * fresh one per access would fail `navigator.plugins === navigator.plugins`
+     * -- the identity check that already caught navigator.languages. */
+    "  var def=function(name,val){"
+    "    if(val===null) return;"
+    "    try{ Object.defineProperty(Navigator.prototype,name,{enumerable:true,configurable:true,"
+    "      get:function(){ return val; }}); }catch(e){} };"
+    "  def('plugins', pa); def('mimeTypes', ma);"
+    "  try{ Object.defineProperty(Navigator.prototype,'pdfViewerEnabled',"
+    "    {enumerable:true,configurable:true,get:function(){ return false; }}); }catch(e){}"
+    "})();";
+
 static const char *FEATURES_JS =
     "(function(){"
     "  var F; try{ F=JSON.parse(window.__evwk_cfg).features; }catch(e){ return; }"
@@ -1250,6 +1301,9 @@ static void on_window_object_cleared (WebKitScriptWorld *world, WebKitWebPage *p
         if (r) g_object_unref (r);
         JSCValue *f = jsc_context_evaluate (ctx, FEATURES_JS, -1);
         if (f) g_object_unref (f);
+        /* before NAMEFIX, like the others: it renames whatever accessors exist */
+        JSCValue *p = jsc_context_evaluate (ctx, PLUGINS_JS, -1);
+        if (p) g_object_unref (p);
         /* after every accessor exists, including the native ones above */
         JSCValue *n = jsc_context_evaluate (ctx, NAMEFIX_JS, -1);
         if (n) g_object_unref (n);

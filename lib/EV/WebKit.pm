@@ -3097,6 +3097,19 @@ Safari profile exposes only C<storage> and C<RTCPeerConnection>. Every stub is
 installed only when the build lacks the real API, so a WebKitGTK that ships one
 keeps it.
 
+B<PDF viewer presence> follows the profile as well. The HTML specification
+hardcodes both states: a browser that displays PDFs inline reports
+C<navigator.pdfViewerEnabled> true and five fixed plugin names, one that does
+not reports false and B<empty> C<plugins>/C<mimeTypes> lists. WebKitGTK reports
+the viewer-present state, which is correct for desktop Chrome, desktop Safari
+and iOS Safari -- but B<not> for C<pixel-chrome>: Chrome for Android had no
+inline PDF viewer at 131 (it shipped 2024-11, the Android viewer appeared behind
+a flag in 2024-12 and became default-on only in Chrome 135, 2025-04), so that
+profile reports the empty state. Override per instance with
+C<< pdf_viewer => 0|1 >>. The empty lists are real C<PluginArray>/
+C<MimeTypeArray> objects, cached like a real browser's, with C<length> left on
+the prototype where it belongs.
+
 B<Ceiling:> the spoof is thorough but not perfect, and these residuals remain.
 B<Workers are not covered at all.> The extension hooks
 C<window-object-cleared>, which fires only for window globals, so a
@@ -3149,16 +3162,7 @@ its C<JSCContext>, making cache/array/context a refcount cycle whose destroy
 notify never runs, which leaks an entire JS context per navigation; and
 anchoring the array on the JavaScript side instead would turn C<languages> into
 a B<data> property where every real browser has an accessor, a louder tell than
-the one being fixed. C<navigator.plugins> and
-C<navigator.mimeTypes> are B<not> spoofed at all: WebKitGTK reports the five
-PDF-viewer entries the HTML specification hardcodes for any browser with
-C<navigator.pdfViewerEnabled> true, which is what desktop Chrome, desktop
-Safari and iOS Safari all report -- but Chrome on B<Android> has no inline PDF
-viewer and reports an empty list, so C<pixel-chrome> is likely wrong here.
-That one is left alone deliberately rather than guessed at: Chrome was
-reportedly gaining an Android PDF viewer around the 131 timeframe, so the
-correct value for that exact version is not settled, and a confidently wrong
-value is worse than a documented gap. Encoding a large canvas through C<toDataURL>
+the one being fixed. Encoding a large canvas through C<toDataURL>
 is markedly slower with C<seed> set, which is itself weakly timeable. And this is the JS layer only -- the
 network-layer fingerprint (TLS JA3/JA4, HTTP/2) is untouched unless you also
 enable C<network_fingerprint> (below). A self-consistent B<custom> profile is
