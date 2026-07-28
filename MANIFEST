@@ -49,6 +49,9 @@ t/70-console.t
 t/71-dialog.t
 t/72-policy.t
 t/73-mock.t
+t/74-element-controls.t
+t/75-download-upload.t
+t/76-on-request.t
 t/80-chrome.t
 t/81-close.t
 t/82-navigate.t

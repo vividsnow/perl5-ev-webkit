@@ -172,7 +172,7 @@ JS
 my %KNOWN_NEW = map { $_ => 1 } qw(
     timeout window display
     on_load on_error on_close on_navigate on_console on_dialog on_policy
-    on_file_chooser on_download
+    on_file_chooser on_download on_request
     data_dir cache_dir ephemeral cookie_jar jar_format
     proxy user_agent devtools title chrome
     fingerprint network_fingerprint seed
@@ -212,6 +212,15 @@ sub new {
         Carp::croak('EV::WebKit: network_fingerprint requires fingerprint => <profile>')
             unless $fp;
         Carp::croak('EV::WebKit: network_fingerprint and an explicit proxy => are mutually exclusive')
+            if exists $o{proxy};
+    }
+    if (defined $o{on_request}) {
+        Carp::croak('EV::WebKit: on_request must be a code reference')
+            unless ref $o{on_request} eq 'CODE';
+        # Same exclusion as network_fingerprint, and for the same reason: the
+        # interception proxy IS this instance's proxy, so it cannot also route
+        # through one the caller chose.
+        Carp::croak('EV::WebKit: on_request and an explicit proxy => are mutually exclusive')
             if exists $o{proxy};
     }
     my $self = bless {
@@ -343,21 +352,47 @@ sub new {
         $session->get_cookie_manager->set_persistent_storage($jar, $fmt);
     }
     $self->set_proxy($o{proxy}) if exists $o{proxy};
-    if ($o{network_fingerprint}) {
+    # Both network_fingerprint and on_request are served by the same in-process
+    # proxy: it is the only place that sees plaintext requests, since WebKit runs
+    # networking in a separate process and exposes no mutable request hook.
+    if ($o{network_fingerprint} || $o{on_request}) {
+        my $why = $o{network_fingerprint} ? 'network_fingerprint' : 'on_request';
         eval { require Proxy::Impersonate; 1 }
-            or Carp::croak("EV::WebKit: network_fingerprint requested but Proxy::Impersonate is unavailable: $@");
-        my $target = ($o{network_fingerprint} =~ /\D/)
-            ? $o{network_fingerprint}                                  # explicit target override
-            : EV::WebKit::Fingerprint::curl_target($o{fingerprint});   # derive from the profile name
-        Carp::croak("EV::WebKit: no curl target for fingerprint '"
-                  . (ref $o{fingerprint} ? '(custom)' : $o{fingerprint})
-                  . "' -- pass network_fingerprint => '<curl-target>'")
-            unless $target;
+            or Carp::croak("EV::WebKit: $why requested but Proxy::Impersonate is unavailable: $@");
+        # on_request needs the hook added in Proxy::Impersonate 0.04. An older
+        # one accepts the option and silently ignores it, so every request would
+        # go upstream unintercepted -- a silent, confusing no-op. Refuse instead.
+        if ($o{on_request}) {
+            eval { Proxy::Impersonate->VERSION('0.04'); 1 }
+                or Carp::croak('EV::WebKit: on_request requires Proxy::Impersonate 0.04 or newer '
+                             . '(found ' . (Proxy::Impersonate->VERSION // '?') . ')');
+        }
+        my $target;
+        if ($o{network_fingerprint}) {
+            $target = ($o{network_fingerprint} =~ /\D/)
+                ? $o{network_fingerprint}                                  # explicit target override
+                : EV::WebKit::Fingerprint::curl_target($o{fingerprint});   # derive from the profile name
+            Carp::croak("EV::WebKit: no curl target for fingerprint '"
+                      . (ref $o{fingerprint} ? '(custom)' : $o{fingerprint})
+                      . "' -- pass network_fingerprint => '<curl-target>'")
+                unless $target;
+        }
+        else {
+            # on_request alone. The proxy re-originates through
+            # libcurl-impersonate whatever happens, so SOME target is presented
+            # -- there is no passthrough mode. Follow the fingerprint profile if
+            # there is one, else a current Chrome, and say so in the POD rather
+            # than changing the connection fingerprint silently.
+            $target = $o{fingerprint} ? EV::WebKit::Fingerprint::curl_target($o{fingerprint}) : undef;
+            $target ||= 'chrome131';
+        }
         my $proxy = Proxy::Impersonate->new(
             impersonate           => $target,
             listen                => '127.0.0.1:0',
-            override_headers      => EV::WebKit::Fingerprint::identity_headers($fp),
-            high_entropy_headers  => EV::WebKit::Fingerprint::high_entropy_headers($fp),
+            ($o{on_request} ? (on_request => $o{on_request}) : ()),
+            # identity headers only make sense alongside a resolved profile
+            ($fp ? (override_headers     => EV::WebKit::Fingerprint::identity_headers($fp),
+                    high_entropy_headers => EV::WebKit::Fingerprint::high_entropy_headers($fp)) : ()),
         );
         $self->{proxy} = $proxy;
         $self->{network_fingerprint} = $target;
@@ -3398,6 +3433,58 @@ native GTK file chooser, exactly as before. A handler that dies, or that
 decides nothing, cancels the request rather than leaving the page waiting on a
 chooser that never resolves.
 
+=head2 C<< on_request => sub { my ($req) = @_ } >>
+
+Intercept every request the browser makes -- rewrite it, answer it locally, or
+refuse it:
+
+    my $b = EV::WebKit->new(on_request => sub {
+        my ($req) = @_;
+        return { status => 403, body => 'no ads here' } if $req->{host} =~ /ads\./;
+        $req->{headers}{'x-trace'} = 'yes';        # rewrite in place
+        return;                                    # ...and let it proceed
+    });
+
+C<$req> has C<method>, C<url>, C<headers>, C<body> and C<host>. Return nothing
+to proceed (carrying any rewrites), a hashref (C<status>, C<headers>, C<body>)
+to answer without touching the network, or the string C<'abort'> to drop the
+connection. A handler that dies refuses the request with a 502 and warns -- it
+fails closed, since this hook exists to block traffic and an exception must not
+let through exactly what you were stopping. Construct-time only.
+
+This works by routing the browser through the same in-process
+L<Proxy::Impersonate> that C<network_fingerprint> uses, because WebKitGTK 6.0
+offers nothing better: the UI process exposes only the observational
+C<sent-request>, the mutable C<send-request> lives solely in the web-process
+extension, and libsoup is unreachable since WebKit2 runs networking in a
+separate process. Interception therefore happens at the one place the plaintext
+exists. Requires L<Proxy::Impersonate> 0.04 (croaks otherwise, rather than
+silently not intercepting), and is mutually exclusive with C<proxy>.
+
+Two consequences worth knowing:
+
+=over 4
+
+=item Requests to local addresses are B<not> intercepted.
+
+WebKit routes localhost and private addresses directly, bypassing the proxy, so
+the hook never sees them. This is WebKit's own behaviour -- C<network_fingerprint>
+has always had it too -- and it cannot be turned off from here.
+
+=item Your connection fingerprint changes.
+
+The proxy always re-originates through C<libcurl-impersonate>; there is no
+passthrough. With C<fingerprint> set, the matching target is used; without one,
+a current Chrome. If that matters, set C<fingerprint> (or
+C<network_fingerprint>) explicitly rather than relying on the default.
+
+=back
+
+Headers are the set forced on top of the impersonation template (C<Cookie>,
+C<Referer>, C<Sec-Fetch-*>, ...), not the template's own (C<User-Agent>,
+C<Accept>, ...) -- see L<Proxy::Impersonate/on_request>. Setting those keys
+still overrides the template.
+
 =head2 Screenshots and PDF
 
 Capture the rendered page.
@@ -3937,6 +4024,12 @@ Called when the page opens a file chooser, which is the only way to populate
 an C<< <input type=file> >>. Without this handler WebKit runs its own native
 chooser, unchanged. See L</"on_file_chooser"> under L</"Downloads and file
 upload">.
+
+=item C<< on_request => sub { my ($req) = @_ } >>
+
+Intercept, rewrite, mock or block every request the browser makes. Routes
+through the in-process proxy, so it does not see local-address traffic and it
+sets a connection fingerprint -- see L</"on_request"> for both caveats.
 
 =back
 
