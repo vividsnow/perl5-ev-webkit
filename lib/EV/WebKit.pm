@@ -1766,16 +1766,24 @@ sub show_devtools {
 
 my $_waiter_seq = 0;
 
-sub wait_for {
-    my ($self, $sel, %o) = (shift, shift);
-    my $cb = pop;
-    Carp::croak('wait_for: last argument must be a callback') unless ref $cb eq 'CODE';
-    %o = @_;
-    if ($self->{_dead} || !$self->{view}) { $self->_defer_final($cb, undef, 'browser closed'); return $self }
-    my $deadline = $o{timeout}  // $self->{timeout};
-    my $interval = $o{interval} // 0.05;
-    $interval = 0.05 unless defined $interval && $interval > 0;   # non-positive interval is meaningless for a poll -- snap to the default (else $elapsed never advances and the zero-delay re-poll busy-loops, starving the whole EV loop)
-    my $visible  = $o{visible};
+# The polling engine behind wait_for and wait_for_js.
+#
+# Extracted rather than copied: everything delicate about wait_for lives in the
+# closure family below -- the ONE shared weak alias, the waiter registry that
+# lets quit() resolve a poll whose round trip is in flight, and the single
+# resolution point that dedupes and breaks the timer self-cycle. A second copy
+# of that would be a second place for any future fix to be forgotten, which is
+# exactly the sibling-site problem this codebase has been bitten by before.
+#
+# %a: probe    -- sub { my ($done) = @_; ... $done->($ok, $payload, $err) }
+#                 called once per tick; $ok true resolves with $payload.
+#      timeout, interval, cb.
+sub _poll_until {
+    my ($self, %a) = @_;
+    my $cb       = $a{cb};
+    my $probe    = $a{probe};
+    my $deadline = $a{timeout};
+    my $interval = $a{interval};
     my $elapsed  = 0;
     my $w;                       # current poll timer
     my $tick;
@@ -1816,39 +1824,113 @@ sub wait_for {
         # that resolution already ran -- $finish's own dedupe makes either
         # order safe.
         return $finish->(undef, 'browser closed') if $self->{_dead};
-        $self->find($sel, sub {
-            my ($el, $err) = @_;
-            return $finish->(undef, $err) if $err;
-            my $decide = sub {
-                my ($ok) = @_;
-                return $finish->($el, undef) if $ok;
-                if ($elapsed >= $deadline) { return $finish->(undef, 'timeout') }
-                $elapsed += $interval;
-                $w = EV::timer($interval, 0, sub { $tick->() });
-            };
-            if ($el && $visible) {
-                return $el->is_visible(sub {
-                    my ($vis, $verr) = @_;
-                    # 'stale element' here is NOT a failure -- it means the node
-                    # find() matched was replaced between that round-trip and
-                    # this one (a spinner swapped for content, a framework
-                    # re-rendering). That is precisely the "not settled yet"
-                    # state wait_for exists to poll through, so keep polling
-                    # instead of finishing on it: a live page that churns the
-                    # selector's node used to make wait_for(visible => 1) fail
-                    # early with an error its own POD never mentions (only
-                    # 'timeout'), rather than waiting for the element to hold
-                    # still. Any OTHER error is real and terminal.
-                    return $decide->(0) if defined $verr && $verr =~ /stale element/;
-                    return $finish->(undef, $verr) if $verr;
-                    $decide->($vis ? 1 : 0);
-                });
-            }
-            $decide->($el ? 1 : 0);
+        $probe->(sub {
+            my ($ok, $payload, $err) = @_;
+            return $finish->(undef, $err) if defined $err;
+            return $finish->($payload, undef) if $ok;
+            if ($elapsed >= $deadline) { return $finish->(undef, 'timeout') }
+            $elapsed += $interval;
+            $w = EV::timer($interval, 0, sub { $tick->() });
         });
     };
     $tick->();
     return $self;
+}
+
+sub wait_for {
+    my ($self, $sel, %o) = (shift, shift);
+    my $cb = pop;
+    Carp::croak('wait_for: last argument must be a callback') unless ref $cb eq 'CODE';
+    %o = @_;
+    Carp::croak('wait_for: gone and visible are mutually exclusive (gone waits for the selector to match NOTHING)')
+        if $o{gone} && $o{visible};
+    if ($self->{_dead} || !$self->{view}) { $self->_defer_final($cb, undef, 'browser closed'); return $self }
+    my $interval = $o{interval} // 0.05;
+    $interval = 0.05 unless defined $interval && $interval > 0;   # non-positive interval is meaningless for a poll -- snap to the default (else $elapsed never advances and the zero-delay re-poll busy-loops, starving the whole EV loop)
+    my $visible = $o{visible};
+    my $gone    = $o{gone};
+    weaken(my $wself = $self);
+    return $self->_poll_until(
+        timeout  => $o{timeout} // $self->{timeout},
+        interval => $interval,
+        cb       => $cb,
+        probe    => sub {
+            my ($done) = @_;
+            my $self = $wself or return;
+            $self->find($sel, sub {
+                my ($el, $err) = @_;
+                return $done->(0, undef, $err) if $err;
+                # gone: success is the selector matching NOTHING, and there is
+                # no element to hand back -- resolve with a plain true instead,
+                # so a caller cannot mistake it for one.
+                return $done->($el ? 0 : 1, 1, undef) if $gone;
+                if ($el && $visible) {
+                    return $el->is_visible(sub {
+                        my ($vis, $verr) = @_;
+                        # 'stale element' here is NOT a failure -- it means the
+                        # node find() matched was replaced between that round
+                        # trip and this one (a spinner swapped for content, a
+                        # framework re-rendering). That is precisely the "not
+                        # settled yet" state wait_for exists to poll through, so
+                        # keep polling instead of finishing on it: a live page
+                        # that churns the selector's node used to make
+                        # wait_for(visible => 1) fail early with an error its own
+                        # POD never mentions (only 'timeout'), rather than
+                        # waiting for the element to hold still. Any OTHER error
+                        # is real and terminal.
+                        return $done->(0, undef, undef) if defined $verr && $verr =~ /stale element/;
+                        return $done->(0, undef, $verr) if $verr;
+                        $done->($vis ? 1 : 0, $el, undef);
+                    });
+                }
+                $done->($el ? 1 : 0, $el, undef);
+            });
+        },
+    );
+}
+
+sub wait_for_js {
+    my ($self, $expr, %o) = (shift, shift);
+    my $cb = pop;
+    Carp::croak('wait_for_js: last argument must be a callback') unless ref $cb eq 'CODE';
+    Carp::croak('wait_for_js: an expression is required') if !defined $expr || ref $expr;
+    %o = @_;
+    if ($self->{_dead} || !$self->{view}) { $self->_defer_final($cb, undef, 'browser closed'); return $self }
+    my $interval = $o{interval} // 0.05;
+    $interval = 0.05 unless defined $interval && $interval > 0;   # see wait_for
+    my $last_err;                # the most recent JS error, for the timeout message
+    weaken(my $wself = $self);
+    my $poll_cb = sub {
+        my ($val, $err) = @_;
+        # Rewrite a bare 'timeout' into something that names the expression AND
+        # the last JS error, if any. A predicate that never becomes true and one
+        # that throws every time both time out, and telling them apart from the
+        # message is the difference between a two-minute fix and an afternoon.
+        if (defined $err && $err eq 'timeout') {
+            $err = "timeout waiting for: $expr" . (defined $last_err ? " (last JS error: $last_err)" : '');
+        }
+        $cb->($val, $err);
+    };
+    return $self->_poll_until(
+        timeout  => $o{timeout} // $self->{timeout},
+        interval => $interval,
+        cb       => $poll_cb,
+        probe    => sub {
+            my ($done) = @_;
+            my $self = $wself or return;
+            $self->script("return ($expr);", sub {
+                my ($val, $err) = @_;
+                # A THROW is not terminal. `window.app.ready` throws a TypeError
+                # for as long as window.app is undefined, which is exactly the
+                # not-ready-yet state this method exists to wait through -- so
+                # failing on it would make the common case unusable. The cost is
+                # that a genuine typo also just times out, which is why the
+                # message above carries the last error.
+                if (defined $err) { $last_err = $err; return $done->(0, undef, undef) }
+                $done->(($val ? 1 : 0), $val, undef);
+            });
+        },
+    );
 }
 
 # Fetch a URI straight to disk, without navigating to it. Useful on its own,
@@ -3439,9 +3521,39 @@ the deadline check and busy-loop the EV loop.
 Also wait for the matched element's C<is_visible> to become true before
 resolving.
 
+=item C<< gone => $bool >>
+
+Invert it: wait for the selector to match B<nothing>. The usual reason is a
+spinner or overlay that must disappear before the page is usable. There is no
+element to hand back, so the callback receives a plain true value rather than
+one -- and C<gone> with C<visible> croaks, since "wait for it to be visible"
+and "wait for it to not exist" cannot both be meant.
+
 =back
 
 On timeout, C<$el> is C<undef> and C<$err eq 'timeout'>. Returns C<$b>.
+
+=head3 wait_for_js
+
+    $b->wait_for_js($expr, %opts, sub { my ($value, $err) = @_; ... });
+
+Polls a JavaScript expression until it is truthy, then resolves with its value.
+Takes the same C<timeout> and C<interval> options as C<wait_for>. For waiting on
+application state rather than on the DOM:
+
+    $b->wait_for_js('window.app && window.app.ready', sub { ... });
+
+B<An expression that throws is not an error, it is "not yet".>
+C<window.app.ready> raises a C<TypeError> for as long as C<window.app> is
+undefined, which is exactly the state you are waiting through -- so a throw is
+treated as false and polling continues. The cost is that a genuine typo also
+just times out, so the timeout message carries both the expression and the last
+JavaScript error:
+
+    timeout waiting for: no_such_fn() (last JS error: ReferenceError: ...)
+
+The expression is evaluated in the page's own world, as C<script> does, so it
+sees the page's globals.
 
 =head2 Downloads and file upload
 
