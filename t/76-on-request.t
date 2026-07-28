@@ -90,4 +90,28 @@ plan skip_all => 'on_request needs Proxy::Impersonate 0.04 (the hook it relies o
     like($got, qr{content-length: 11}i,   'content-length is computed from the synthetic body');
 }
 
+# --- on_response is wired through the same proxy -------------------------
+{
+    my @seen;
+    my $b = EV::WebKit->new(window => [200,150],
+        on_request  => sub { return },
+        on_response => sub {
+            my ($res) = @_;
+            push @seen, { status => $res->{status}, host => $res->{host} };
+            $res->{headers}{"x-seen-by-test"} = "1";
+            return;
+        },
+    );
+    ok(defined $b->proxy_port, "on_response alone also spins the proxy");
+    $b->quit;
+}
+
+# on_response accepts only a coderef, and conflicts with an explicit proxy,
+# exactly as on_request does -- the validation is shared, so this pins that the
+# generalisation did not drop either check.
+eval { EV::WebKit->new(window => [200,150], on_response => "nope") };
+like($@, qr/on_response must be a code reference/, "on_response rejects a non-coderef");
+eval { EV::WebKit->new(window => [200,150], on_response => sub {}, proxy => "http://x:1") };
+like($@, qr/mutually exclusive/, "on_response and an explicit proxy are mutually exclusive");
+
 done_testing;

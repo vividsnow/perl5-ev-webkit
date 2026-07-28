@@ -172,7 +172,7 @@ JS
 my %KNOWN_NEW = map { $_ => 1 } qw(
     timeout window display
     on_load on_error on_close on_navigate on_console on_dialog on_policy
-    on_file_chooser on_download on_request
+    on_file_chooser on_download on_request on_response
     data_dir cache_dir ephemeral cookie_jar jar_format
     proxy user_agent devtools title chrome
     fingerprint network_fingerprint seed
@@ -214,13 +214,14 @@ sub new {
         Carp::croak('EV::WebKit: network_fingerprint and an explicit proxy => are mutually exclusive')
             if exists $o{proxy};
     }
-    if (defined $o{on_request}) {
-        Carp::croak('EV::WebKit: on_request must be a code reference')
-            unless ref $o{on_request} eq 'CODE';
+    for my $h (qw(on_request on_response)) {
+        next unless defined $o{$h};
+        Carp::croak("EV::WebKit: $h must be a code reference")
+            unless ref $o{$h} eq 'CODE';
         # Same exclusion as network_fingerprint, and for the same reason: the
         # interception proxy IS this instance's proxy, so it cannot also route
         # through one the caller chose.
-        Carp::croak('EV::WebKit: on_request and an explicit proxy => are mutually exclusive')
+        Carp::croak("EV::WebKit: $h and an explicit proxy => are mutually exclusive")
             if exists $o{proxy};
     }
     my $self = bless {
@@ -352,19 +353,22 @@ sub new {
         $session->get_cookie_manager->set_persistent_storage($jar, $fmt);
     }
     $self->set_proxy($o{proxy}) if exists $o{proxy};
-    # Both network_fingerprint and on_request are served by the same in-process
-    # proxy: it is the only place that sees plaintext requests, since WebKit runs
-    # networking in a separate process and exposes no mutable request hook.
-    if ($o{network_fingerprint} || $o{on_request}) {
-        my $why = $o{network_fingerprint} ? 'network_fingerprint' : 'on_request';
+    # network_fingerprint and the two interception hooks are all served by the
+    # same in-process proxy: it is the only place that sees plaintext requests,
+    # since WebKit runs networking in a separate process and exposes no mutable
+    # request hook of its own.
+    if ($o{network_fingerprint} || $o{on_request} || $o{on_response}) {
+        my $why = $o{network_fingerprint} ? 'network_fingerprint'
+                : $o{on_request}          ? 'on_request'
+                :                           'on_response';
         eval { require Proxy::Impersonate; 1 }
             or Carp::croak("EV::WebKit: $why requested but Proxy::Impersonate is unavailable: $@");
-        # on_request needs the hook added in Proxy::Impersonate 0.04. An older
-        # one accepts the option and silently ignores it, so every request would
-        # go upstream unintercepted -- a silent, confusing no-op. Refuse instead.
-        if ($o{on_request}) {
+        # Both hooks arrived in Proxy::Impersonate 0.04. An older one accepts the
+        # option and silently ignores it, so nothing would be intercepted -- a
+        # silent, confusing no-op rather than an error. Refuse instead.
+        if ($o{on_request} || $o{on_response}) {
             eval { Proxy::Impersonate->VERSION('0.04'); 1 }
-                or Carp::croak('EV::WebKit: on_request requires Proxy::Impersonate 0.04 or newer '
+                or Carp::croak("EV::WebKit: $why requires Proxy::Impersonate 0.04 or newer "
                              . '(found ' . (Proxy::Impersonate->VERSION // '?') . ')');
         }
         my $target;
@@ -389,7 +393,8 @@ sub new {
         my $proxy = Proxy::Impersonate->new(
             impersonate           => $target,
             listen                => '127.0.0.1:0',
-            ($o{on_request} ? (on_request => $o{on_request}) : ()),
+            ($o{on_request}  ? (on_request  => $o{on_request})  : ()),
+            ($o{on_response} ? (on_response => $o{on_response}) : ()),
             # identity headers only make sense alongside a resolved profile
             ($fp ? (override_headers     => EV::WebKit::Fingerprint::identity_headers($fp),
                     high_entropy_headers => EV::WebKit::Fingerprint::high_entropy_headers($fp)) : ()),
@@ -3670,6 +3675,37 @@ C<Referer>, C<Sec-Fetch-*>, ...), not the template's own (C<User-Agent>,
 C<Accept>, ...) -- see L<Proxy::Impersonate/on_request>. Setting those keys
 still overrides the template.
 
+=head3 on_response
+
+    my $b = EV::WebKit->new(on_response => sub {
+        my ($res) = @_;
+        delete $res->{headers}{'content-security-policy'};   # the usual reason
+        delete $res->{headers}{'x-frame-options'};
+        return;
+    });
+
+The counterpart to C<on_request>, called when each response's head arrives and
+before any of it reaches the page. C<$res> has C<status>, C<headers>, and the
+request's C<url>, C<method> and C<host>. Modify C<status> or C<headers> in
+place; the return value is ignored. Construct-time only, and it carries the same
+caveats as C<on_request> -- local addresses are not intercepted, and the
+connection fingerprint changes.
+
+Stripping a policy header is what this is usually for: a page that refuses to
+frame, or a C<Content-Security-Policy> that blocks the script you want to
+inject, can be relaxed here rather than worked around.
+
+Framing is not yours to change: C<Content-Length>, C<Connection> and the
+hop-by-hop headers are restored after the handler runs, because a handler that
+edits them desynchronises the browser's connection rather than its own. Bodies
+are out of scope too -- they stream with backpressure. Use C<on_request>'s
+synthetic response to replace content wholesale.
+
+Unlike C<on_request>, a handler that B<dies> passes the response through and
+warns. It fails B<open> deliberately: the request has already been made, so
+there is no longer anything to protect by refusing, and breaking the page over
+a bug in an observer would be worse.
+
 =head2 Screenshots and PDF
 
 Capture the rendered page.
@@ -4214,6 +4250,12 @@ chooser, unchanged. See L</"on_file_chooser"> for the object it receives.
 Intercept, rewrite, mock or block every request the browser makes. Routes
 through the in-process proxy, so it does not see local-address traffic and it
 sets a connection fingerprint -- see L</"on_request"> for both caveats.
+
+=item C<< on_response => sub { my ($res) = @_ } >>
+
+Observe or rewrite each response's status and headers before the page sees
+them -- stripping C<Content-Security-Policy> is the usual reason. Same proxy,
+same caveats. See L</"on_response">.
 
 =back
 
