@@ -1492,6 +1492,34 @@ sub uri        { my $s=$_[0]; ($s->{_dead} || !$s->{view}) ? undef : $s->{view}-
 sub title      { my $s=$_[0]; ($s->{_dead} || !$s->{view}) ? undef : $s->{view}->get_title }
 sub is_loading { my $s=$_[0]; ($s->{_dead} || !$s->{view}) ? 0     : ($s->{view}->is_loading ? 1 : 0) }
 
+# HTTP status of the current document, or undef when the load had none.
+#
+# Worth having because a navigation's own ok/err cannot tell you this: WebKit
+# reports a 404 or a 500 as a perfectly successful load (they have bodies, and
+# it displays them), so ok is 1 and err undef for both. Verified live.
+#
+# Deliberately a synchronous accessor rather than another callback argument:
+# the value is available from load-changed:committed onward and stays correct,
+# so reading it inside a nav callback works -- and this way the navigation state
+# machine, which took eleven review rounds to settle, is not touched at all.
+#
+# Redirects resolve to the FINAL response (a 302 chain reports the 200), which
+# is what a caller means by "the status of this page".
+sub status {
+    my $s = shift;
+    return undef if $s->{_dead} || !$s->{view};
+    # Each step is eval-guarded and may legitimately be absent: no main resource
+    # before the first commit, and no response at all when nothing was received
+    # over HTTP (see the POD -- a refused connection lands here).
+    my $res  = eval { $s->{view}->get_main_resource } or return undef;
+    my $resp = eval { $res->get_response }            or return undef;
+    my $code = eval { $resp->get_status_code };
+    # 0 is what a non-HTTP load (load_html, and some custom schemes) reports; it
+    # is not a status, so say so with undef rather than passing 0 to a caller who
+    # will reasonably compare it numerically.
+    return (defined $code && $code > 0) ? $code : undef;
+}
+
 sub html { my ($s, $cb) = @_; Carp::croak('html: callback must be a code reference') if defined $cb && ref $cb ne 'CODE'; $s->_call_js('return document.documentElement ? document.documentElement.outerHTML : null;', {}, $cb); return $s }
 
 sub set_user_agent {
@@ -3288,6 +3316,47 @@ Current document title. Synchronous.
     my $bool = $b->is_loading;
 
 True while a navigation is in progress. Synchronous.
+
+=head3 status
+
+    my $code = $b->status;      # 200, 404, 500, ... or undef
+
+HTTP status of the current document, or C<undef> if the load had none.
+Synchronous, and available from the moment the document commits -- so reading it
+inside a C<go> callback works.
+
+B<You need this to detect a failed page, because the navigation callback will
+not tell you.> WebKit treats a 404 or a 500 as a perfectly successful load --
+they have bodies and it displays them -- so C<$ok> is true and C<$err> is
+C<undef> for both:
+
+    $b->go($uri, sub {
+        my ($ok, $err) = @_;
+        die "navigation failed: $err\n" if $err;         # transport-level only
+        my $st = $b->status // 0;
+        die "server said $st\n" if $st >= 400;           # what you actually meant
+    });
+
+A redirect chain reports the B<final> response, not the redirect: a 301 that
+lands on a 200 reports 200.
+
+C<undef> means the load carried no HTTP status, which covers two cases worth
+telling apart in your head:
+
+=over 4
+
+=item *
+
+There was no HTTP transaction at all -- C<load_html>, and some custom schemes.
+
+=item *
+
+Nothing was received: a refused connection, a DNS failure. Note that these
+B<also> resolve the navigation with C<$ok> true, because WebKit successfully
+loads its own error page and reports that as a completed load. C<undef> status
+is the signal; C<$err> stays empty.
+
+=back
 
 =head3 html
 
