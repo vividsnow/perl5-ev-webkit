@@ -2,6 +2,9 @@ Changes
 cpanfile
 eg/browser.pl
 eg/control.pl
+eg/fingerprint.pl
+eg/intercept.pl
+eg/scrape.pl
 lib/EV/WebKit.pm
 lib/EV/WebKit/Client.pm
 lib/EV/WebKit/Client/Element.pm

@@ -3231,7 +3231,7 @@ Event callbacks -- see L</"EVENTS">.
 
 Load pages and read basic document state.
 
-=head2 go
+=head3 go
 
     $b->go($uri, sub { my ($result, $err) = @_; ... });
 
@@ -3243,7 +3243,7 @@ C<load-changed:finished> signal, to give the web process time to propagate
 C<title>/C<uri> to the UI process; C<on_load> (if configured) fires right
 after it. Returns C<$b> (chainable).
 
-=head2 load_html
+=head3 load_html
 
     $b->load_html($html, sub { my ($result, $err) = @_; ... });
 
@@ -3271,25 +3271,25 @@ and return 1 or 0.
 Note: load_html does not add entries to the back-forward list; only real
 navigations (go, links, redirects) do.
 
-=head2 uri
+=head3 uri
 
     my $uri = $b->uri;
 
 Current document URI. Synchronous.
 
-=head2 title
+=head3 title
 
     my $title = $b->title;
 
 Current document title. Synchronous.
 
-=head2 is_loading
+=head3 is_loading
 
     my $bool = $b->is_loading;
 
 True while a navigation is in progress. Synchronous.
 
-=head2 html
+=head3 html
 
     $b->html(sub { my ($html, $err) = @_; ... });
 
@@ -3310,7 +3310,7 @@ character string. Do not C<utf8::encode> a string before handing it to any
 of these; that would turn it into a byte string and produce mojibake on the
 JS side instead.
 
-=head2 script
+=head3 script
 
     $b->script($js, sub { my ($result, $err) = @_; ... });
 
@@ -3319,7 +3319,7 @@ works) and JSON-marshals its C<return> value back as C<$result> (a plain
 scalar, arrayref, or hashref; JS C<undefined> or no C<return> becomes Perl
 C<undef>). A thrown JS exception becomes C<$err>. Returns C<$b>.
 
-=head2 script_async
+=head3 script_async
 
     $b->script_async($body, \%args, sub { my ($result, $err) = @_; ... });
 
@@ -3331,7 +3331,7 @@ C<find>/C<find_all>/element methods are built on. Returns C<$b>.
 
 Locate DOM elements and hand back L<EV::WebKit::Element> handles.
 
-=head2 find
+=head3 find
 
     $b->find($selector, sub { my ($el, $err) = @_; ... });
 
@@ -3339,14 +3339,14 @@ Runs C<document.querySelector($selector)>. C<$el> is an
 L<EV::WebKit::Element> on a match, or C<undef> if nothing matched --
 not-found is not an error (C<$err> is C<undef> in that case too).
 
-=head2 find_all
+=head3 find_all
 
     $b->find_all($selector, sub { my ($els, $err) = @_; ... });
 
 Like C<find>, but C<querySelectorAll>: C<$els> is a (possibly empty)
 arrayref of L<EV::WebKit::Element>.
 
-=head2 wait_for
+=head3 wait_for
 
     $b->wait_for($selector, %opts, sub { my ($el, $err) = @_; ... });
 
@@ -3378,7 +3378,7 @@ On timeout, C<$el> is C<undef> and C<$err eq 'timeout'>. Returns C<$b>.
 
 Fetch resources to disk, and drive file inputs.
 
-=head2 download
+=head3 download
 
     $b->download($uri, $path, sub { my ($path, $err) = @_; ... });
 
@@ -3394,7 +3394,7 @@ C<"The URL can't be shown">. C<file://> URIs produce no download at all.
 A download still in flight when C<quit> is called resolves with
 C<'browser closed'>, like every other pending operation.
 
-=head2 C<< on_download => sub { my ($download) = @_ } >>
+=head3 on_download
 
 Called when the B<page> starts a download (a link with C<download>, a response
 WebKit will not display). The handler must name a destination:
@@ -3415,7 +3415,7 @@ filename), C<destination>, C<progress>, C<received>, C<save_to($path,
 overwrite =E<gt> $bool)>, C<on_finish($cb)> and C<cancel>. It stays valid until
 the download finishes or fails, unlike the dialog and policy objects.
 
-=head2 C<< on_file_chooser => sub { my ($chooser) = @_ } >>
+=head3 on_file_chooser
 
 Called when the page opens a file chooser -- a click on C<< <input type=file> >>,
 which is the only way to populate one, since a file input's value cannot be set
@@ -3437,7 +3437,7 @@ native GTK file chooser, exactly as before. A handler that dies, or that
 decides nothing, cancels the request rather than leaving the page waiting on a
 chooser that never resolves.
 
-=head2 C<< on_request => sub { my ($req) = @_ } >>
+=head3 on_request
 
 Intercept every request the browser makes -- rewrite it, answer it locally, or
 refuse it:
@@ -3493,7 +3493,7 @@ still overrides the template.
 
 Capture the rendered page.
 
-=head2 screenshot
+=head3 screenshot
 
     $b->screenshot($path, sub { my ($result, $err) = @_; ... });
     $b->screenshot(\%opts, sub { my ($result, $err) = @_; ... });
@@ -3524,7 +3524,7 @@ no file is written even if C<$path> was also given.
 
 Returns C<$b>.
 
-=head2 pdf
+=head3 pdf
 
     $b->pdf($path, %opts, sub { my ($result, $err) = @_; ... });
 
@@ -3581,19 +3581,19 @@ same path is therefore safely queued behind it, never racing its write.
 
 User-Agent and arbitrary WebKitSettings properties.
 
-=head2 set_user_agent
+=head3 set_user_agent
 
     $b->set_user_agent($ua_string);
 
 Sets the User-Agent. Synchronous, returns C<$b>.
 
-=head2 user_agent
+=head3 user_agent
 
     my $ua = $b->user_agent;
 
 Current User-Agent. Synchronous.
 
-=head2 settings
+=head3 settings
 
     $b->settings({ enable_javascript => 0, ... });
 
@@ -3605,7 +3605,7 @@ croak on an unknown property name may leave earlier keys in the same call
 already applied (reference values are all rejected up front, so a typed-value
 mistake is caught before anything is set).
 
-=head2 show_devtools
+=head3 show_devtools
 
     $b->show_devtools;
 
@@ -3616,7 +3616,7 @@ Inspector window. Synchronous, returns C<$b>.
 
 Proxy configuration and custom URI-scheme handlers.
 
-=head2 set_proxy
+=head3 set_proxy
 
     $b->set_proxy($uri);
     $b->set_proxy({ default => $uri, ignore => [@hosts] });
@@ -3634,7 +3634,7 @@ invalid or empty default URI (including a C<< { default => ... } >> hash
 with no C<default>) makes this method C<Carp::croak> instead, fail-fast
 rather than silently discarding the proxy.
 
-=head2 mock_scheme
+=head3 mock_scheme
 
     $b->mock_scheme($scheme, sub { my ($uri) = @_; return ($body, $content_type) });
 
@@ -3666,7 +3666,7 @@ session. C<cookie_jar> (see C<new>) gives native persistent storage for
 non-session cookies automatically; C<save_cookies>/C<load_cookies> below
 are an explicit, opt-in JSON snapshot mechanism -- see L</"LIMITATIONS">.
 
-=head2 set_cookie
+=head3 set_cookie
 
     $b->set_cookie(\%spec, sub { my ($ok, $err) = @_; ... });
 
@@ -3676,7 +3676,7 @@ C<%spec>: C<name>, C<value>, C<domain>, C<path> (default C</>), C<max_age>
 C<"set_cookie: missing '<key>'"> if C<name>/C<value>/C<domain> is missing
 from C<%spec>. Returns C<$b>.
 
-=head2 cookies
+=head3 cookies
 
     $b->cookies($uri, sub { my ($list, $err) = @_; ... });
 
@@ -3685,14 +3685,14 @@ http_only }> hashrefs visible to C<$uri> (C<secure>/C<http_only> are 1 or
 0). Errors with C<'cookies: uri required'> if C<$uri> is missing/empty.
 Returns C<$b>.
 
-=head2 clear_cookies
+=head3 clear_cookies
 
     $b->clear_cookies(sub { my ($ok, $err) = @_; ... });
 
 Clears every cookie in this instance's session (not scoped to a single
 domain/URI). Returns C<$b>.
 
-=head2 save_cookies
+=head3 save_cookies
 
     $b->save_cookies($file, sub { my ($count, $err) = @_; ... });
     $b->save_cookies($file, \@uris, sub { my ($count, $err) = @_; ... });
@@ -3710,7 +3710,7 @@ is no URI list (navigate first, or pass C<\@uris> explicitly), or a
 filesystem error. Cookie I<expiry> is deliberately not part of the saved
 data -- see L</"LIMITATIONS">. Returns C<$b>.
 
-=head2 load_cookies
+=head3 load_cookies
 
     $b->load_cookies($file, sub { my ($loaded, $err) = @_; ... });
 
@@ -3733,7 +3733,7 @@ C<'snapshot file required'> if C<$file> is missing/empty. Returns C<$b>.
 
 Inject your own JavaScript and CSS into the pages this instance loads.
 
-=head2 add_user_script
+=head3 add_user_script
 
     my $h = $b->add_user_script($js, %opts);
 
@@ -3784,7 +3784,7 @@ silently truncate the injected content); on an invalid option value or an unknow
 option key; and -- unlike the quiet-no-op mutators (see L</Lifecycle>) -- on a
 call after the browser is closed (there is no handle it could meaningfully return).
 
-=head2 add_user_style
+=head3 add_user_style
 
     my $h = $b->add_user_style($css, %opts);
 
@@ -3804,7 +3804,7 @@ override that beats page CSS -- use it to reliably hide elements
 
 Returns an L</EV::WebKit::UserContent> handle.
 
-=head2 remove_all_user_scripts
+=head3 remove_all_user_scripts
 
     $b->remove_all_user_scripts;
 
@@ -3812,7 +3812,7 @@ Remove every script added with L</add_user_script>. Does not touch the module's
 own internal injection (the element registry that L</find> and L</html> rely on).
 Chainable.
 
-=head2 remove_all_user_styles
+=head3 remove_all_user_styles
 
     $b->remove_all_user_styles;
 
@@ -3859,7 +3859,7 @@ Whether the web-process extension was built at install.
 
 Tear the instance down.
 
-=head2 quit
+=head3 quit
 
     $b->quit;
 
@@ -4026,8 +4026,7 @@ reasoning.
 
 Called when the page opens a file chooser, which is the only way to populate
 an C<< <input type=file> >>. Without this handler WebKit runs its own native
-chooser, unchanged. See L</"on_file_chooser"> under L</"Downloads and file
-upload">.
+chooser, unchanged. See L</"on_file_chooser"> for the object it receives.
 
 =item C<< on_request => sub { my ($req) = @_ } >>
 
@@ -4085,6 +4084,93 @@ Let the navigation/response proceed.
 =item C<block>
 
 Cancel the navigation/response.
+
+=back
+
+=head1 EV::WebKit::Download
+
+Passed to C<on_download>. B<Unlike> the dialog and policy objects, this one
+outlives the handler that received it: WebKit reports progress and completion
+later, so it stays valid until the download finishes, fails, or the browser
+closes.
+
+=over 4
+
+=item C<uri>
+
+The URI being downloaded.
+
+=item C<suggested>
+
+The filename the server suggested (from C<Content-Disposition>, else derived
+from the URI). Only known once WebKit asks for a destination, which is when
+C<on_download> runs -- so it is available there, and C<undef> before.
+
+=item C<save_to($path, overwrite =E<gt> $bool)>
+
+Choose where the download lands. B<Required>: a download whose handler names no
+destination is cancelled, because WebKit's own default would write into the
+user's Downloads directory behind the caller's back. C<$path> is a plain
+filesystem path (a C<file://> URI is accepted and stripped).
+
+=item C<on_finish($cb)>
+
+Register the completion callback: C<< $cb->($path, $err) >>. C<$path> is where
+the file landed; on failure C<$path> is C<undef> and C<$err> a message. Fires
+exactly once. Registering after the download has already finished still
+delivers, so there is no race in setting it late.
+
+=item C<destination>
+
+The path chosen by C<save_to>, or C<undef>.
+
+=item C<progress>
+
+Estimated completion, 0 to 1.
+
+=item C<received>
+
+Bytes received so far.
+
+=item C<cancel>
+
+Abort the download. C<on_finish> then reports the cancellation.
+
+=back
+
+=head1 EV::WebKit::FileChooser
+
+Passed to C<on_file_chooser>. Valid only for the duration of that call.
+
+=over 4
+
+=item C<select(@paths)>
+
+Answer the chooser with these files. Croaks on a path that does not exist, or
+on several paths when the input accepts only one -- WebKit itself would
+silently hand the page an unreadable entry instead.
+
+Note the page does not see the files B<immediately>: WebKit applies the
+selection asynchronously, so C<files.length> read in the callback of the
+C<click> that opened the chooser is still 0, and correct a tick later.
+
+=item C<cancel>
+
+Refuse the chooser. This is also what happens automatically if the handler
+returns without deciding, or dies -- an unanswered request would leave the page
+waiting on a chooser that never resolves.
+
+=item C<mime_types>
+
+The C<accept=> list as a plain list of strings; empty means anything.
+
+=item C<multiple>
+
+True if the input accepts more than one file.
+
+=item C<selected>
+
+Files already selected on the input, as a list.
 
 =back
 
@@ -4285,6 +4371,41 @@ L<Glib::IO>, L<EV>, L<EV::Glib>, and L<Cpanel::JSON::XS> (falls back to
 L<JSON::PP> if unavailable). Xvfb (or a real X server) to actually run
 anything. Linux only. No XS/C compiler is needed for this distribution
 itself.
+
+=head1 EXAMPLES
+
+Runnable scripts ship in C<eg/>. Each is headless under C<xvfb-run -a> and
+visible with a real C<$DISPLAY>.
+
+=over 4
+
+=item C<eg/scrape.pl>
+
+The commonest shape: navigate, pull structured data out of the DOM, save a
+screenshot. Start here -- it also shows which accessors are synchronous
+(C<title>, C<uri>) and which take a callback (everything that touches the page).
+
+=item C<eg/fingerprint.pl>
+
+Present as another device, then print what the page actually sees, side by side
+with what the profile claims. Takes a profile name.
+
+=item C<eg/intercept.pl>
+
+Log, block, mock and rewrite requests through C<on_request>. Needs
+L<Proxy::Impersonate> 0.04 and a real external URI (local addresses bypass the
+proxy -- see L</on_request>).
+
+=item C<eg/browser.pl>
+
+A real browser window with chrome, optionally listening on a control socket so
+another process can drive it while you watch.
+
+=item C<eg/control.pl>
+
+The other end of that socket: drives a running browser from a separate process.
+
+=back
 
 =head1 SEE ALSO
 
