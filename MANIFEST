@@ -2,6 +2,7 @@ Changes
 cpanfile
 eg/browser.pl
 eg/control.pl
+eg/element-shot.pl
 eg/fingerprint.pl
 eg/intercept.pl
 eg/scrape.pl

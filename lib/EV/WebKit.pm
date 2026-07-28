@@ -4717,6 +4717,19 @@ screenshot. Start here -- it also shows which accessors are synchronous
 Present as another device, then print what the page actually sees, side by side
 with what the profile claims. Takes a profile name.
 
+=item C<eg/element-shot.pl>
+
+Screenshot a single element, by cropping a full-page capture to its
+L<EV::WebKit::Element/box>. Uses L<Imager> if it is installed and says what it
+skipped if not. This is a recipe rather than an API because cropping needs an
+image library and this distribution does not depend on one for a single method.
+
+Worth reading for one detail even if you never crop anything: the scale between
+CSS pixels and captured pixels is B<measured> (image width against
+C<window.innerWidth>) rather than read from C<window.devicePixelRatio> -- which
+C<fingerprint> spoofs in JavaScript while the real rendering scale is unchanged,
+so trusting it would put the crop in the wrong place on a spoofed profile.
+
 =item C<eg/intercept.pl>
 
 Log, block, mock and rewrite requests through C<on_request>. Needs
