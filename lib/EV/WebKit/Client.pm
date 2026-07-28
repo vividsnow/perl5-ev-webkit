@@ -10,7 +10,7 @@ use MIME::Base64 ();
 use EV::WebKit::Protocol;
 use EV::WebKit::Client::Element;
 
-our $VERSION = '0.01';
+our $VERSION = '0.04';
 
 # Drive a browser running in another process. See
 # docs/superpowers/specs/2026-07-13-control-protocol-design.md

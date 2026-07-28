@@ -1,6 +1,6 @@
 package EV::WebKit;
 use v5.10; use strict; use warnings;
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use Glib::Object::Introspection;
 use Glib::IO;   # Gio bindings: Cancellable, MemoryInputStream

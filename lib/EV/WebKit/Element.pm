@@ -1,7 +1,7 @@
 package EV::WebKit::Element;
 use v5.10; use strict; use warnings;
 use Carp ();
-our $VERSION = '0.01';
+our $VERSION = '0.04';
 
 sub _new { my ($class, $browser, $id, $epoch) = @_; bless { b => $browser, id => $id, epoch => $epoch }, $class }
 
@@ -156,6 +156,80 @@ sub submit {
       . 'return true;',
         {}, $_[1]);
 }
+
+# Bring the element into the viewport. Not merely a convenience: click() on an
+# off-screen element works in the DOM but a page that reacts to scroll position
+# (lazy images, sticky headers, infinite scroll) will not have done its work
+# yet, so a subsequent read sees the pre-scroll state.
+sub scroll_into_view {
+    $_[0]->_call_js(
+        'const el = window.__evwk.get(A.id, A.epoch);'
+      . 'el.scrollIntoView({block:"center", inline:"center"});'
+      . 'return true;',
+        {}, $_[1]);
+}
+
+# Hover. A real pointer entering an element produces pointerover/mouseover (which
+# bubble) AND pointerenter/mouseenter (which do NOT), then a move; menus and
+# tooltips variously listen for any of them, so sending only mouseover leaves a
+# menu that opens on mouseenter shut. isTrusted is false for all of these -- a
+# page checking it is not fooled (documented in the Ceiling).
+sub hover {
+    $_[0]->_call_js(
+        'const el = window.__evwk.get(A.id, A.epoch);'
+      . 'const r = el.getBoundingClientRect();'
+      . 'const at = { bubbles:true, cancelable:true, view:window,'
+      . '             clientX: r.left + r.width/2, clientY: r.top + r.height/2 };'
+      . 'for (const t of ["pointerover","mouseover"]) {'
+      . '  el.dispatchEvent(new (window.PointerEvent && t[0] === "p" ? PointerEvent : MouseEvent)(t, at)); }'
+      . 'for (const t of ["pointerenter","mouseenter"]) {'
+      . '  el.dispatchEvent(new (window.PointerEvent && t[0] === "p" ? PointerEvent : MouseEvent)(t, {...at, bubbles:false})); }'
+      . 'el.dispatchEvent(new MouseEvent("mousemove", at));'
+      . 'return true;',
+        {}, $_[1]);
+}
+
+# Select an <option> by value, or by visible label when no value matches. Setting
+# el.value alone is not enough: every framework binds to input/change, so a
+# silent assignment updates the DOM and leaves the application state stale.
+sub select_option {
+    my ($s, $value, $cb) = @_;
+    _need_name(select_option => $value);   # same positional-binding trap as attr/prop
+    $s->_call_js(
+        'const el = window.__evwk.get(A.id, A.epoch);'
+      . 'if (!(el instanceof HTMLSelectElement)) throw new Error("element is not a <select>");'
+      . 'const opts = [...el.options];'
+      . 'let i = opts.findIndex(o => o.value === A.value);'
+      . 'if (i < 0) i = opts.findIndex(o => (o.label || o.textContent || "").trim() === A.value);'
+      . 'if (i < 0) throw new Error("no option with value or label " + JSON.stringify(A.value));'
+      . 'el.selectedIndex = i;'
+      . 'el.dispatchEvent(new Event("input",  {bubbles:true}));'
+      . 'el.dispatchEvent(new Event("change", {bubbles:true}));'
+      . 'return opts[i].value;',
+        { value => $value }, $cb);
+}
+
+# Set a checkbox/radio to $on (default true). click() would TOGGLE, so calling it
+# twice to "make sure" silently undoes itself; this is idempotent by construction
+# and a no-op (no events) when the box is already in the requested state, which is
+# also what a real user clicking an already-checked radio produces.
+sub check {
+    my ($s, @arg) = @_;
+    my $cb  = (@arg && ref $arg[-1] eq 'CODE') ? pop @arg : undef;
+    my $on  = @arg ? ($arg[0] ? 1 : 0) : 1;
+    $s->_call_js(
+        'const el = window.__evwk.get(A.id, A.epoch);'
+      . 'if (!(el instanceof HTMLInputElement) || !/^(checkbox|radio)$/.test(el.type))'
+      . '  throw new Error("element is not a checkbox or radio");'
+      . 'if (el.checked === !!A.on) return !!A.on;'
+      . 'el.checked = !!A.on;'
+      . 'el.dispatchEvent(new Event("input",  {bubbles:true}));'
+      . 'el.dispatchEvent(new Event("change", {bubbles:true}));'
+      . 'return !!A.on;',
+        { on => $on }, $cb);
+}
+sub uncheck { my ($s, $cb) = @_; $s->check(0, $cb ? ($cb) : ()) }
+
 1;
 
 =pod
@@ -325,6 +399,50 @@ the element itself if it has no C<form> (e.g. calling C<submit> directly on
 a C<< <form> >> element). This bypasses any C<onsubmit> handler and may
 navigate the page. Resolves successfully even if there was nothing to
 submit (a silent no-op).
+
+=head2 select_option
+
+    $el->select_option($value, $cb);   # $cb->($selected_value, $err)
+
+Selects an C<< <option> >> of a C<< <select> >> by its C<value>, falling back
+to matching the visible label when no value matches -- so an option written as
+C<< <option>Beta</option> >>, which has an empty value, is still reachable by
+the text the user sees. Fires C<input> and C<change> so page code bound to
+those actually runs; assigning C<el.value> alone updates the DOM and leaves
+application state stale. Errors if the element is not a C<< <select> >>, or if
+no option matches.
+
+=head2 check / uncheck
+
+    $el->check($cb);          # ensure checked
+    $el->check(0, $cb);       # ensure UNchecked
+    $el->uncheck($cb);        # the same thing, spelled out
+
+Sets a checkbox or radio to a definite state and resolves with that state.
+Deliberately not C<click>: clicking B<toggles>, so calling it twice "to be
+sure" silently undoes itself. These are idempotent -- already in the requested
+state means no change and, like a real browser, B<no> C<change> event. Errors
+if the element is not a checkbox or radio.
+
+=head2 hover
+
+    $el->hover($cb);
+
+Dispatches the pointer/mouse sequence an entering cursor produces:
+C<pointerover>/C<mouseover> (which bubble), then C<pointerenter>/C<mouseenter>
+(which do not), then C<mousemove>, positioned at the element's centre. Menus
+and tooltips listen for various of these, so dispatching only C<mouseover>
+leaves a menu that opens on C<mouseenter> shut. These are synthetic events:
+C<isTrusted> is false, so a page that checks it is not fooled.
+
+=head2 scroll_into_view
+
+    $el->scroll_into_view($cb);
+
+Scrolls the element to the centre of the viewport. Worth doing before reading
+around it: C<click> works on an off-screen element, but a page that reacts to
+scroll position (lazy images, infinite scroll, sticky headers) will not have
+done that work yet.
 
 =head1 SEE ALSO
 

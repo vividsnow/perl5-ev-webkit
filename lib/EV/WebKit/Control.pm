@@ -11,7 +11,7 @@ use MIME::Base64 ();
 use Scalar::Util qw(weaken);
 use EV::WebKit::Protocol;
 
-our $VERSION = '0.01';
+our $VERSION = '0.04';
 
 # A control server for a RUNNING EV::WebKit instance: another process can drive
 # the browser this one opened. See
