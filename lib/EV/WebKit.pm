@@ -1191,6 +1191,73 @@ sub _call_js {
 sub script       { my ($s,$js,$cb)      = @_; Carp::croak('script: callback must be a code reference')       if defined $cb && ref $cb ne 'CODE'; $s->_call_js($js, {}, $cb, 1); return $s }
 sub script_async { my ($s,$body,$a,$cb) = @_; Carp::croak('script_async: callback must be a code reference') if defined $cb && ref $cb ne 'CODE'; $s->_call_js($body, $a, $cb, 1); return $s }
 
+# Send a key to whatever currently has focus (else document.body). For keyboard
+# HANDLERS -- Escape closing a modal, Enter submitting a form that listens for
+# it, arrow keys driving a widget.
+#
+# It does NOT type: a synthetic KeyboardEvent has isTrusted false, and no engine
+# performs the default text-insertion for one, so press('a') leaves an input's
+# value untouched. Element->type is what edits a field. Saying so here because
+# the opposite assumption is the obvious one, and it fails silently.
+my %KEYCODE = (          # the keys whose keyCode a listener is likely to check
+    Enter => 13, Escape => 27, Tab => 9, Backspace => 8, Delete => 46,
+    ArrowUp => 38, ArrowDown => 40, ArrowLeft => 37, ArrowRight => 39,
+    Home => 36, End => 35, PageUp => 33, PageDown => 34, ' ' => 32,
+);
+sub press {
+    my ($self, $key, %o) = (shift, shift);
+    my $cb = (@_ && ref $_[-1] eq 'CODE') ? pop : undef;
+    %o = @_;
+    Carp::croak('press: a key name is required') if !defined $key || ref $key || !length $key;
+    if (my @bad = sort grep { !/^(?:shift|ctrl|alt|meta)$/ } keys %o) {
+        Carp::croak("press: unknown option(s): @bad (expected shift/ctrl/alt/meta)");
+    }
+    my $code = $KEYCODE{$key} // (length($key) == 1 ? ord(uc $key) : 0);
+    $self->_call_js(
+        'const el = document.activeElement || document.body;'
+      . 'const init = { key: A.key, code: A.key.length === 1 ? "Key" + A.key.toUpperCase() : A.key,'
+      . '               keyCode: A.code, which: A.code, bubbles: true, cancelable: true,'
+      . '               shiftKey: !!A.shift, ctrlKey: !!A.ctrl, altKey: !!A.alt, metaKey: !!A.meta };'
+      . 'const down = new KeyboardEvent("keydown", init);'
+      . 'const notCancelled = el.dispatchEvent(down);'
+      # a real browser skips keypress when keydown was prevented, and only sends
+      # it for character-producing keys at all
+      . 'if (notCancelled && A.key.length === 1) el.dispatchEvent(new KeyboardEvent("keypress", init));'
+      . 'el.dispatchEvent(new KeyboardEvent("keyup", init));'
+      . 'return notCancelled;',
+        { key => $key, code => $code,
+          shift => ($o{shift} ? 1 : 0), ctrl => ($o{ctrl} ? 1 : 0),
+          alt   => ($o{alt}   ? 1 : 0), meta => ($o{meta} ? 1 : 0) },
+        $cb);
+    return $self;
+}
+
+# Scroll the page. Absolute by default; to => 'bottom' for the common
+# infinite-scroll case, which needs the document height rather than a guess.
+sub scroll {
+    my ($self, %o) = @_;
+    my $cb = delete $o{cb};
+    if (!$cb && exists $o{callback}) { $cb = delete $o{callback} }
+    if (my @bad = sort grep { !/^(?:x|y|by|to)$/ } keys %o) {
+        Carp::croak("scroll: unknown option(s): @bad (expected x/y/by/to)");
+    }
+    Carp::croak("scroll: to must be 'top' or 'bottom'")
+        if defined $o{to} && $o{to} !~ /^(?:top|bottom)$/;
+    $self->_call_js(
+        'const d = document.documentElement, b = document.body;'
+      . 'const maxY = Math.max(d.scrollHeight, b ? b.scrollHeight : 0) - window.innerHeight;'
+      . 'let x = window.scrollX, y = window.scrollY;'
+      . 'if (A.to === "top")    { x = 0; y = 0; }'
+      . 'else if (A.to === "bottom") { y = maxY > 0 ? maxY : 0; }'
+      . 'else if (A.by)         { x += (A.x || 0); y += (A.y || 0); }'
+      . 'else                   { if (A.x !== null) x = A.x; if (A.y !== null) y = A.y; }'
+      . 'window.scrollTo(x, y);'
+      . 'return { x: window.scrollX, y: window.scrollY };',
+        { x => $o{x}, y => $o{y}, by => ($o{by} ? 1 : 0), to => $o{to} },
+        $cb);
+    return $self;
+}
+
 sub find {
     my ($self, $sel, $cb) = @_;
     Carp::croak('find: callback must be a code reference') if defined $cb && ref $cb ne 'CODE';
@@ -3482,6 +3549,43 @@ C<undef>). A thrown JS exception becomes C<$err>. Returns C<$b>.
 Same as C<script>, but C<\%args> is JSON-encoded and made available inside
 C<$body> as the const C<A> (e.g. C<A.foo>). This is the primitive
 C<find>/C<find_all>/element methods are built on. Returns C<$b>.
+
+=head3 press
+
+    $b->press($key, %modifiers, $cb);   # $cb->($not_cancelled, $err)
+
+Sends C<keydown>, optionally C<keypress>, then C<keyup> to whatever currently
+has focus (else C<document.body>). Modifiers: C<shift>, C<ctrl>, C<alt>,
+C<meta>. Resolves false if a handler called C<preventDefault> on the keydown.
+
+    $b->press('Escape', sub { ... });          # close a modal
+    $b->press('Enter', ctrl => 1, sub { ... });
+
+For keyboard B<handlers> -- Escape closing a dialog, Enter submitting a form
+that listens for it, arrows driving a widget.
+
+B<It does not type.> A synthetic C<KeyboardEvent> has C<isTrusted> false, and no
+engine performs the default text insertion for one, so C<< press('a') >> leaves
+an input's value untouched. Use L<EV::WebKit::Element/type> to edit a field.
+This is stated plainly because the opposite assumption is the natural one and it
+fails silently.
+
+Named keys (C<Enter>, C<Escape>, C<Tab>, C<Backspace>, C<Delete>, the arrows,
+C<Home>, C<End>, C<PageUp>, C<PageDown>) carry the C<keyCode> a listener is
+likely to check; a single character gets its uppercase ordinal. As in a real
+browser, C<keypress> is sent only for character keys, and not at all if the
+keydown was cancelled.
+
+=head3 scroll
+
+    $b->scroll(y => 500, cb => $cb);            # absolute
+    $b->scroll(by => 1, y => 100, cb => $cb);   # relative to where you are
+    $b->scroll(to => 'bottom', cb => $cb);      # the infinite-scroll case
+    $b->scroll(to => 'top', cb => $cb);
+
+Scrolls the page and resolves with the resulting C<< { x, y } >>. C<to =>
+'bottom'> computes the document height rather than guessing a large number,
+which is what makes it reliable for lazy-loading pages.
 
 =head2 Elements
 

@@ -230,6 +230,26 @@ sub check {
 }
 sub uncheck { my ($s, $cb) = @_; $s->check(0, $cb ? ($cb) : ()) }
 
+# Geometry, as a hashref: x/y/width/height/top/left/bottom/right plus the
+# page-relative page_x/page_y. Viewport-relative like getBoundingClientRect
+# itself, which is what a caller comparing against a screenshot wants; page_x/y
+# add the scroll offset for anyone who needs absolute document coordinates.
+#
+# An element that is not rendered at all (display:none, or detached) has a rect
+# of all zeros in every browser. Reporting that as a box would be a lie a caller
+# could easily divide by, so it comes back undef instead, with is_visible left as
+# the way to ask the question directly.
+sub box {
+    $_[0]->_call_js(
+        'const el = window.__evwk.get(A.id, A.epoch);'
+      . 'const r = el.getBoundingClientRect();'
+      . 'if (!r.width && !r.height && !r.x && !r.y) return null;'
+      . 'return { x: r.x, y: r.y, width: r.width, height: r.height,'
+      . '         top: r.top, left: r.left, bottom: r.bottom, right: r.right,'
+      . '         page_x: r.x + window.scrollX, page_y: r.y + window.scrollY };',
+        {}, $_[1]);
+}
+
 1;
 
 =pod
@@ -434,6 +454,21 @@ C<pointerover>/C<mouseover> (which bubble), then C<pointerenter>/C<mouseenter>
 and tooltips listen for various of these, so dispatching only C<mouseover>
 leaves a menu that opens on C<mouseenter> shut. These are synthetic events:
 C<isTrusted> is false, so a page that checks it is not fooled.
+
+=head2 box
+
+    $el->box($cb);   # $cb->($box, $err)
+
+The element's geometry as a hashref: C<x>, C<y>, C<width>, C<height>, C<top>,
+C<left>, C<bottom>, C<right> -- viewport-relative, exactly as
+C<getBoundingClientRect> gives them, which is what you want when comparing
+against a screenshot -- plus C<page_x> and C<page_y>, the same origin with the
+scroll offset added, for absolute document coordinates.
+
+C<$box> is C<undef> for an element that is not rendered (C<display:none>, or
+detached from the document). Such an element has an all-zero rect in every
+browser, and returning that as a box would be a plausible-looking lie a caller
+could divide by; ask L</is_visible> if that is the question.
 
 =head2 scroll_into_view
 

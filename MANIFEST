@@ -58,6 +58,7 @@ t/76-on-request.t
 t/77-pdf-plugins.t
 t/78-status.t
 t/79-wait-predicate.t
+t/80-input-geometry.t
 t/80-chrome.t
 t/81-close.t
 t/82-navigate.t
