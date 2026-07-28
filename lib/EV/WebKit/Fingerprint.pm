@@ -523,3 +523,67 @@ sub _coherence {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+EV::WebKit::Fingerprint - profile data behind EV::WebKit's fingerprint option
+
+=head1 DESCRIPTION
+
+The preset device profiles (C<windows-chrome>, C<macos-safari>,
+C<iphone-safari>, C<pixel-chrome>), their validation, and the marshalling that
+hands them to the bundled web-process extension. Used by L<EV::WebKit>. You do
+not normally touch it directly: pass C<< fingerprint => >> to
+L<EV::WebKit/new> and read L<EV::WebKit/fingerprint> back, which is also where
+the profile keys, the override rules and the B<Ceiling> -- what this spoof does
+and does not hide -- are documented.
+
+Two of its functions are re-exported as methods for convenience:
+C<< EV::WebKit->fingerprint_profiles >> lists the preset names, and
+C<< EV::WebKit->fingerprint_available >> reports whether the compiled
+extension was found. Prefer those.
+
+=head1 FUNCTIONS
+
+None of these are exported; call them fully qualified if you must.
+
+=head2 available
+
+    my $ok = EV::WebKit::Fingerprint::available();
+
+True if the compiled web-process extension (C<evwk_fp.so>) was located -- in
+an installed dist via L<File::ShareDir>, or the in-tree C<share/> during
+development. Without it C<< fingerprint => >> croaks.
+
+=head2 profiles
+
+    my @names = EV::WebKit::Fingerprint::profiles();
+
+The preset names, sorted.
+
+=head2 resolve
+
+    my $fp = EV::WebKit::Fingerprint::resolve('windows-chrome');
+    my $fp = EV::WebKit::Fingerprint::resolve({ profile => 'macos-safari', ... });
+
+Expands a preset name, or a hashref of overrides over an optional C<profile>
+base, into the full profile hash. Croaks on an unknown preset, an unknown key,
+or a value of the wrong shape -- deliberately, so a typo cannot silently
+produce a half-spoofed and therefore B<incoherent> device.
+
+=head2 gvariant
+
+    my $v = EV::WebKit::Fingerprint::gvariant($fp, $seed);
+
+Marshals a resolved profile into the C<a{sv}> C<GVariant> the extension reads
+at startup. C<$seed> is optional and enables readback noise.
+
+=head2 curl_target, identity_headers, high_entropy_headers
+
+Support for C<< network_fingerprint => >>: the libcurl-impersonate target
+matching a preset, and the identity / client-hint headers that must be forced
+over that target's defaults so the JS and HTTP layers agree.
+
+=cut

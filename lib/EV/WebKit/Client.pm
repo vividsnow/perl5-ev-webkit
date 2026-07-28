@@ -359,6 +359,7 @@ EV::WebKit::Client - drive an EV::WebKit browser running in another process
 
 Blocking, which is what you want from a shell or a one-off script:
 
+    use v5.10;                 # for say(), as the eg/ scripts do
     use EV::WebKit::Client;
 
     my $c = EV::WebKit::Client->connect("$ENV{XDG_RUNTIME_DIR}/evwk.sock");
