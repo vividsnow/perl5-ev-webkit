@@ -7,7 +7,7 @@ use Glib::IO;   # Gio bindings: Cancellable, MemoryInputStream
 use EV::WebKit::Element;
 use File::Spec::Functions 'rel2abs';
 use File::Path ();
-use Scalar::Util 'weaken';
+use Scalar::Util qw(weaken refaddr);
 use Carp ();   # Carp::croak -- core, no prereq change
 
 use constant NAV_SETTLE_DELAY => 0.01;   # WebKitGTK is multi-process: let web-process props (title/uri) propagate past load-changed:finished
@@ -169,6 +169,14 @@ JS
 # mistyped proxy => would route DIRECT (deanonymization), and a mistyped
 # data_dir => would silently fall back to an ephemeral session (no persistence).
 # Keep in sync with the options read below and the CONSTRUCTOR POD.
+# A digit string modulo 2**32, never numifying the whole value: every
+# intermediate stays under 2**33, which is exact on any perl. See new()'s seed.
+sub _reduce32 {
+    my $r = 0;
+    $r = ($r * 10 + $_) % 4294967296 for split //, $_[0];
+    return $r;
+}
+
 my %KNOWN_NEW = map { $_ => 1 } qw(
     timeout window display
     on_load on_error on_close on_navigate on_console on_dialog on_policy
@@ -183,6 +191,13 @@ sub new {
     _setup() or die "EV::WebKit: required typelibs unavailable\n";
     if (my @bad = sort grep { !$KNOWN_NEW{$_} } keys %o) {
         Carp::croak("EV::WebKit: unknown option(s): @bad");
+    }
+    # Checked here rather than at fire time, where a non-coderef surfaces only
+    # as a warn from the dispatch eval and the handler simply never runs.
+    for my $h (qw(on_error on_load on_close on_navigate on_console on_dialog
+                  on_policy on_file_chooser on_download)) {
+        next unless defined $o{$h};
+        Carp::croak("EV::WebKit: $h must be a code reference") if ref $o{$h} ne 'CODE';
     }
     my $fp;   # resolved fingerprint profile (or undef)
     if (defined $o{fingerprint}) {
@@ -204,11 +219,20 @@ sub new {
         # wraps while ARM saturates, so an unreduced seed (a millisecond epoch, or
         # hex(substr($digest,0,16))) would silently produce DIFFERENT noise per
         # architecture. Reducing in Perl keeps that deterministic everywhere.
-        $o{seed} %= 2**32;
+        #
+        # (_reduce32 works digit by digit: `%` is exact only up to a UV, and a
+        # digest-derived seed is bigger than that on a 32-bit perl.)
+        $o{seed} = _reduce32($o{seed});
     }
     if ($o{network_fingerprint}) {
-        Carp::croak('EV::WebKit: network_fingerprint must be 1 or a curl-target string')
-            if ref $o{network_fingerprint};
+        # 1 (derive from the profile) or a curl target like 'chrome131'. A real
+        # target always has a letter, which is what tells the two apart below --
+        # rejecting only references let `=> 2` pass as 1 and `=> 0.5` pass as a
+        # target name.
+        Carp::croak("EV::WebKit: network_fingerprint must be 1 or a curl-target string like 'chrome131'")
+            if ref $o{network_fingerprint}
+            || !length $o{network_fingerprint}
+            || ($o{network_fingerprint} ne '1' && $o{network_fingerprint} !~ /[A-Za-z]/);
         Carp::croak('EV::WebKit: network_fingerprint requires fingerprint => <profile>')
             unless $fp;
         Carp::croak('EV::WebKit: network_fingerprint and an explicit proxy => are mutually exclusive')
@@ -295,7 +319,10 @@ sub new {
     # cookie_jar OR data_dir forces a non-ephemeral session: WebKit's
     # set_persistent_storage (cookie_jar) and its on-disk storage (data_dir)
     # both bail out for an ephemeral session.
-    my $ephemeral = ($o{cookie_jar} || defined $o{data_dir})
+    # `defined`, not truthiness, for BOTH: '0' is a valid relative path (and
+    # survives the empty-path croak above), but tested for truth it left the
+    # session ephemeral -- where set_persistent_storage silently does nothing.
+    my $ephemeral = (defined $o{cookie_jar} || defined $o{data_dir})
         ? 0 : (defined $o{ephemeral} ? $o{ephemeral} : 1);
 
     # data_dir points the whole session -- cookies, localStorage, IndexedDB,
@@ -764,20 +791,37 @@ sub new {
         # closures below are the only thing referencing it, and its per-download
         # callbacks live on it. Dropped in _finish.
         $self->{_downloads}{$d->{seq}} = $d;
+        # Indexed by the native's identity, which is how download() finds this
+        # wrapper -- see there for why the uri cannot be the key.
+        $self->{_dl_native}{ $d->{native} } = $d;
         # Claim the destination/callback parked by download(), if this is one of
         # ours. A page-initiated download matches nothing and falls through to
         # on_download below, exactly as before.
-        if (defined(my $u = $d->uri)) {
-            if (my $q = $self->{_dl_want}{$u}) {
-                if (my $want = shift @$q) {
-                    delete $self->{_dl_want}{$u} unless @$q;
-                    $d->save_to($want->{dest});
-                    $d->on_finish($want->{cb}) if $want->{cb};
-                }
+        if (my $want = delete $self->{_dl_want}{ $d->{native} }) {
+            # Callback FIRST: the parked entry is already gone, so until it is on
+            # the wrapper it is reachable from nowhere, and anything that throws
+            # in between strands it. The eval is belt-and-braces (download() has
+            # already normalised the path) -- a throw escaping into GLib here
+            # would also leave decide-destination unconnected, letting WebKit
+            # choose the destination itself.
+            $d->on_finish($want->{cb}) if $want->{cb};
+            unless (eval { $d->save_to($want->{dest}); 1 }) {
+                my $e = _clean($@) || 'could not set the download destination';
+                warn "EV::WebKit: $e";
+                eval { $dl->cancel };
+                $d->_finish(undef, $e);
+                return;
             }
         }
-        $dl->signal_connect('decide-destination' => sub {
+        # Handler ids kept: these closures capture $d, and $d holds the native as
+        # {dl} -- a cycle refcounting cannot break. Broken in _unhook.
+        push @{ $d->{sig} }, $dl->signal_connect('decide-destination' => sub {
             my (undef, $suggested) = @_;
+            # The ONE download signal that calls user code synchronously (WebKit
+            # wants the answer before writing anything), so it carries the guard
+            # its siblings do. finished/failed reach user code only via _defer,
+            # on a clean tick, and do not need it.
+            local $IN_DISPATCH = 1;
             my $s = $wself or return 0;
             $d->{suggested} = $suggested;
             # dest may have been chosen up-front by on_download (below); if not,
@@ -803,13 +847,13 @@ sub new {
             $dl->set_destination($d->{dest});
             return 1;   # handled -- we set it
         });
-        $dl->signal_connect(finished => sub {
+        push @{ $d->{sig} }, $dl->signal_connect(finished => sub {
             my $s = $wself or return;
             # 'finished' also fires after a cancel; _finish dedupes, so the
             # cancel path's error is the one that reaches the caller.
             $d->_finish($d->{dest}, undef);
         });
-        $dl->signal_connect(failed => sub {
+        push @{ $d->{sig} }, $dl->signal_connect(failed => sub {
             my (undef, $gerr) = @_;
             my $s = $wself or return;
             my $msg = eval { $gerr->message } || 'download failed';
@@ -1199,33 +1243,70 @@ sub script_async { my ($s,$body,$a,$cb) = @_; Carp::croak('script_async: callbac
 # performs the default text-insertion for one, so press('a') leaves an input's
 # value untouched. Element->type is what edits a field. Saying so here because
 # the opposite assumption is the obvious one, and it fails silently.
-my %KEYCODE = (          # the keys whose keyCode a listener is likely to check
+# Named keys: the keyCode a listener is likely to check. event.code for these is
+# the name itself.
+my %KEYCODE = (
     Enter => 13, Escape => 27, Tab => 9, Backspace => 8, Delete => 46,
     ArrowUp => 38, ArrowDown => 40, ArrowLeft => 37, ArrowRight => 39,
-    Home => 36, End => 35, PageUp => 33, PageDown => 34, ' ' => 32,
+    Home => 36, End => 35, PageUp => 33, PageDown => 34,
 );
+# Punctuation, as one table of [code, keyCode] so the two cannot disagree.
+# Neither is derivable from the character: event.code names the PHYSICAL key,
+# and keyCode is the legacy US-layout OEM value. Deriving keyCode from the
+# ordinal is not merely wrong but ALIASES other keys -- ord('.') is 46, which is
+# Delete, and ord("'") is 39, ArrowRight.
+my %CHAR = (
+    ' '  => ['Space',         32], '-' => ['Minus',       189], '=' => ['Equal',      187],
+    '['  => ['BracketLeft',  219], ']' => ['BracketRight',221], '\\'=> ['Backslash',  220],
+    ';'  => ['Semicolon',    186], "'" => ['Quote',       222], '`' => ['Backquote',  192],
+    ','  => ['Comma',        188], '.' => ['Period',      190], '/' => ['Slash',      191],
+);
+# ($code, $keyCode) for a key name.
+sub _key_ids {
+    my $k = shift;
+    return ($k, $KEYCODE{$k})         if exists $KEYCODE{$k};
+    return @{ $CHAR{$k} }             if exists $CHAR{$k};
+    return ('Key' . uc $k, ord uc $k) if $k =~ /\A[A-Za-z]\z/;   # KeyA .. KeyZ, 65-90
+    return ('Digit' . $k, ord $k)     if $k =~ /\A[0-9]\z/;      # Digit0 .. Digit9, 48-57
+    return ($k, 0)                    if length($k) > 1;         # an unlisted named key (F5, Insert)
+    # A shifted or non-ASCII character names no physical key by itself -- which
+    # one produced it depends on the layout. Report what a browser reports for a
+    # key it cannot identify, rather than inventing a value that aliases another.
+    return ('', 0);
+}
 sub press {
     my ($self, $key, %o) = (shift, shift);
     my $cb = (@_ && ref $_[-1] eq 'CODE') ? pop : undef;
     %o = @_;
     Carp::croak('press: a key name is required') if !defined $key || ref $key || !length $key;
+    # Stringify before the JSON bridge: an integer crosses as a JSON number, and
+    # A.key.length below is then undefined, so press(5) sent no keypress.
+    $key = "$key";
     if (my @bad = sort grep { !/^(?:shift|ctrl|alt|meta)$/ } keys %o) {
         Carp::croak("press: unknown option(s): @bad (expected shift/ctrl/alt/meta)");
     }
-    my $code = $KEYCODE{$key} // (length($key) == 1 ? ord(uc $key) : 0);
+    my ($code_name, $code) = _key_ids($key);
     $self->_call_js(
         'const el = document.activeElement || document.body;'
-      . 'const init = { key: A.key, code: A.key.length === 1 ? "Key" + A.key.toUpperCase() : A.key,'
+      # A KeyboardEvent is a UIEvent and a real one carries the window. Built in
+      # the isolated world, but WebKit maps it to the page's own on the way.
+      . 'const init = { key: A.key, code: A.code_name, view: window,'
       . '               keyCode: A.code, which: A.code, bubbles: true, cancelable: true,'
       . '               shiftKey: !!A.shift, ctrlKey: !!A.ctrl, altKey: !!A.alt, metaKey: !!A.meta };'
       . 'const down = new KeyboardEvent("keydown", init);'
       . 'const notCancelled = el.dispatchEvent(down);'
       # a real browser skips keypress when keydown was prevented, and only sends
       # it for character-producing keys at all
-      . 'if (notCancelled && A.key.length === 1) el.dispatchEvent(new KeyboardEvent("keypress", init));'
-      . 'el.dispatchEvent(new KeyboardEvent("keyup", init));'
+      # Enter produces a character ("\r") and every engine fires keypress for it,
+      # which is what makes the legacy onkeypress-checks-13 form handler work.
+      . 'if (notCancelled && (A.key.length === 1 || A.key === "Enter"))'
+      . '  el.dispatchEvent(new KeyboardEvent("keypress", init));'
+      # keyup goes wherever focus is NOW: a keydown handler that moves focus is
+      # ordinary, and a browser delivers the keyup to the newly focused element.
+      . 'const up = document.activeElement || document.body;'
+      . 'up.dispatchEvent(new KeyboardEvent("keyup", init));'
       . 'return notCancelled;',
-        { key => $key, code => $code,
+        { key => $key, code => $code, code_name => $code_name,
           shift => ($o{shift} ? 1 : 0), ctrl => ($o{ctrl} ? 1 : 0),
           alt   => ($o{alt}   ? 1 : 0), meta => ($o{meta} ? 1 : 0) },
         $cb);
@@ -1238,11 +1319,24 @@ sub scroll {
     my ($self, %o) = @_;
     my $cb = delete $o{cb};
     if (!$cb && exists $o{callback}) { $cb = delete $o{callback} }
+    # The same croak every other async method makes: a non-CODE callback is
+    # truthy, so it reaches _call_js and dies inside the deferred completion,
+    # where $EV::DIED swallows it and the caller's EV::run simply hangs.
+    Carp::croak('scroll: cb must be a code reference') if defined $cb && ref $cb ne 'CODE';
     if (my @bad = sort grep { !/^(?:x|y|by|to)$/ } keys %o) {
         Carp::croak("scroll: unknown option(s): @bad (expected x/y/by/to)");
     }
     Carp::croak("scroll: to must be 'top' or 'bottom'")
         if defined $o{to} && $o{to} !~ /^(?:top|bottom)$/;
+    # Numify, so the offsets cross as JSON NUMBERS: a string makes `x += A.x`
+    # below a CONCATENATION, and scroll(by => 1, y => '50') from 100 scrolled to
+    # 10050. Right by accident from the origin, so it shows up on the second
+    # relative scroll -- and an offset out of a config file or @ARGV is a string.
+    for my $k (qw(x y)) {
+        next unless defined $o{$k};
+        Carp::croak("scroll: $k must be a number") unless Scalar::Util::looks_like_number($o{$k});
+        $o{$k} += 0;
+    }
     $self->_call_js(
         'const d = document.documentElement, b = document.body;'
       . 'const maxY = Math.max(d.scrollHeight, b ? b.scrollHeight : 0) - window.innerHeight;'
@@ -1251,16 +1345,35 @@ sub scroll {
       . 'else if (A.to === "bottom") { y = maxY > 0 ? maxY : 0; }'
       . 'else if (A.by)         { x += (A.x || 0); y += (A.y || 0); }'
       . 'else                   { if (A.x !== null) x = A.x; if (A.y !== null) y = A.y; }'
-      . 'window.scrollTo(x, y);'
+      # behavior:"instant" is what makes the position this returns true. Under a
+      # page's own CSS `scroll-behavior: smooth` the scroll is an ANIMATION, so
+      # the read-back below sees the offset it started from.
+      . 'window.scrollTo({ left: x, top: y, behavior: "instant" });'
       . 'return { x: window.scrollX, y: window.scrollY };',
         { x => $o{x}, y => $o{y}, by => ($o{by} ? 1 : 0), to => $o{to} },
         $cb);
     return $self;
 }
 
+# The positional-binding trap the Element atoms already guard (see
+# EV::WebKit::Element::_need_name). find(sub{...}) bound the callback to $sel
+# and left $cb undef, so the encode error went to a no-op and the caller was
+# never called at all; find(undef) marshalled a JSON null, which querySelector
+# coerces to the type selector "null" -- indistinguishable from "not there".
+sub _need_selector {
+    my ($what, $sel) = @_;
+    Carp::croak("$what: a selector is required") unless defined $sel;
+    Carp::croak("$what: the selector must be a plain string, not a " . ref($sel) . ' reference'
+              . (ref $sel eq 'CODE' ? ' (did you omit the selector and pass only a callback?)' : ''))
+        if ref $sel;
+    Carp::croak("$what: the selector must not be empty") unless length $sel;
+    return;
+}
+
 sub find {
     my ($self, $sel, $cb) = @_;
     Carp::croak('find: callback must be a code reference') if defined $cb && ref $cb ne 'CODE';
+    _need_selector(find => $sel);
     $cb ||= sub {};   # an omitted callback is allowed -- the completion below calls $cb unconditionally, so give it a no-op rather than dying on undef
     # This wrapper closure (passed as _call_js's $cb) is itself captured
     # STRONGLY by _call_js's own (permanently GI-retained) completion
@@ -1292,6 +1405,7 @@ sub find {
 sub find_all {
     my ($self, $sel, $cb) = @_;
     Carp::croak('find_all: callback must be a code reference') if defined $cb && ref $cb ne 'CODE';
+    _need_selector(find_all => $sel);
     $cb ||= sub {};   # omitted callback allowed -- see find()
     # same reasoning as find() above -- weaken.
     weaken(my $wself = $self);
@@ -1856,18 +1970,23 @@ sub _poll_until {
     my $probe    = $a{probe};
     my $deadline = $a{timeout};
     my $interval = $a{interval};
-    my $elapsed  = 0;
+    # REAL time, not a count of polls. Counting one interval per completed probe
+    # ignored the probe's own round trip -- and each is a full JS round trip, so
+    # the overshoot was unbounded: a 2s wait took ~40s on a page where find()
+    # took a second.
+    my $started  = EV::now;
     my $w;                       # current poll timer
+    my $deadline_timer;          # independent hard deadline -- see below
     my $tick;
     my $wid;                     # registry id -- declared before $finish so its closure can capture it
     my $done = 0;                # idempotency guard: quit() and the normal tick path can each try to resolve
-    # $finish, like $tick just below, is transitively captured (via $decide's
-    # static reference to $tick, for its reschedule branch) into find()'s
-    # wrapper closure, which -- via _call_js -- ends up strongly held by the
-    # permanently GI-retained call_async_javascript_function completion
-    # closure. So $finish's own capture of $self (needed below to
-    # self-deregister from the waiter registry) must be weakened too, exactly
-    # like $tick's -- one shared weak alias for the whole wait_for closure
+    # $finish, like $tick just below, is transitively captured into the probe's
+    # own completion closure -- $tick hands $finish to $probe, and the probe
+    # (wait_for's find(), wait_for_js's script()) passes that on to _call_js,
+    # whose GAsyncReadyCallback closure Glib::Object::Introspection retains
+    # PERMANENTLY even after it fires. So $finish's own capture of $self (needed
+    # below to self-deregister from the waiter registry) must be weakened too,
+    # exactly like $tick's -- one shared weak alias for the whole closure
     # family, established before either closure is built.
     weaken(my $wself = $self);
     my $finish = sub {           # single resolution point: break the $tick self-cycle + release the timer
@@ -1875,6 +1994,7 @@ sub _poll_until {
         return if $done++;       # already resolved (e.g. quit() got there first) -- no-op
         delete $wself->{_waiters}{$wid} if $wself;
         undef $w;
+        undef $deadline_timer;
         undef $tick;
         $cb->($el, $err);
     };
@@ -1889,6 +2009,12 @@ sub _poll_until {
     # sole thing keeping $self alive.
     $wid = ++$_waiter_seq;
     $self->{_waiters}{$wid} = $finish;
+    # The check above only runs when a probe COMPLETES, so a probe slower than
+    # the whole wait still overruns it. This answers at the time asked for
+    # whatever the probe is doing; $finish dedupes, so racing it is safe. Not
+    # armed for a non-positive deadline, which keeps "always probe once".
+    $deadline_timer = EV::timer($deadline, 0, sub { $finish->(undef, 'timeout') })
+        if $deadline && $deadline > 0;
     $tick = sub {
         my $self = $wself or return;
         # belt-and-braces: quit()'s waiter registry (above) is what makes
@@ -1897,11 +2023,16 @@ sub _poll_until {
         # order safe.
         return $finish->(undef, 'browser closed') if $self->{_dead};
         $probe->(sub {
+            # Already resolved (by the deadline timer, or quit)? Then do not
+            # fall through to the re-poll branch, which would arm a timer calling
+            # the $tick $finish has just undef'd. The elapsed check below catches
+            # this on its own except when timer and completion land in one loop
+            # sweep, sharing a cached EV::now that rounds a ULP short.
+            return if $done;
             my ($ok, $payload, $err) = @_;
             return $finish->(undef, $err) if defined $err;
             return $finish->($payload, undef) if $ok;
-            if ($elapsed >= $deadline) { return $finish->(undef, 'timeout') }
-            $elapsed += $interval;
+            if (EV::now - $started >= $deadline) { return $finish->(undef, 'timeout') }
             $w = EV::timer($interval, 0, sub { $tick->() });
         });
     };
@@ -1990,8 +2121,21 @@ sub wait_for_js {
         probe    => sub {
             my ($done) = @_;
             my $self = $wself or return;
-            $self->script("return ($expr);", sub {
-                my ($val, $err) = @_;
+            # Truthiness decided in JAVASCRIPT, and the value marshalled
+            # SEPARATELY so its failure cannot sink the verdict. Both halves
+            # matter: JSON.stringify DROPS a function, so deciding in Perl made
+            # wait_for_js('window.jQuery') time out on a value truthy throughout
+            # (and "0" is true in JS, false in Perl); and it THROWS on a cycle or
+            # a BigInt, so returning the raw value beside the verdict lost the
+            # whole payload for wait_for_js('window') and for any framework
+            # object, which are built of back-references. !! runs once, on a
+            # variable, so a side-effecting expression is still evaluated once.
+            # __wf is _call_js's own lone-surrogate repair.
+            $self->script("const __v = ($expr);"
+                        . " let __j; try { __j = JSON.stringify(__v,"
+                        . " (k, v) => typeof v === 'string' ? __wf(v) : v) } catch (e) { }"
+                        . " return { t: !!__v, j: __j === undefined ? null : __j };", sub {
+                my ($r, $err) = @_;
                 # A THROW is not terminal. `window.app.ready` throws a TypeError
                 # for as long as window.app is undefined, which is exactly the
                 # not-ready-yet state this method exists to wait through -- so
@@ -1999,7 +2143,10 @@ sub wait_for_js {
                 # that a genuine typo also just times out, which is why the
                 # message above carries the last error.
                 if (defined $err) { $last_err = $err; return $done->(0, undef, undef) }
-                $done->(($val ? 1 : 0), $val, undef);
+                return $done->(0, undef, undef) unless ref $r eq 'HASH';
+                # j is the value's own JSON text, or null when it had none.
+                my $val = defined $r->{j} ? eval { _dec($r->{j}) } : undef;
+                $done->(($r->{t} ? 1 : 0), $val, undef);
             });
         },
     );
@@ -2012,7 +2159,12 @@ sub wait_for_js {
 sub download {
     my ($self, $uri, $path, $cb) = @_;
     Carp::croak('download: callback must be a code reference') if defined $cb && ref $cb ne 'CODE';
-    Carp::croak('download: a destination path is required') if !defined $path || ref $path || !length $path;
+    # Normalise HERE, with the same rule save_to applies -- and croak at the
+    # call site, where the caller can act on it. Left to the save_to inside the
+    # download-started handler, the croak escaped into GLib's dispatch (which
+    # only warns), stranding the callback and leaving decide-destination
+    # unconnected for WebKit to answer however it liked.
+    $path = EV::WebKit::Download::_norm_dest($path, 'download');
     if (!defined $uri || !length $uri) {
         $self->_defer_final($cb, undef, 'download: uri required') if $cb;
         return $self;
@@ -2022,18 +2174,33 @@ sub download {
         return $self;
     }
     # The destination and callback belong to THIS request, but they can only be
-    # applied once WebKit raises download-started. Park them under the uri we
-    # are about to ask for; the handler claims the matching entry (and a
-    # page-initiated download, which matches nothing, still reaches
-    # on_download). A list per uri, so two downloads of the same uri do not
-    # clobber each other.
-    push @{ $self->{_dl_want}{$uri} }, { dest => $path, cb => $cb };
-    eval { $self->{view}->download_uri($uri); 1 } or do {
+    # applied once WebKit raises download-started. Key them by the identity of
+    # the WebKitDownload that download_uri hands back -- NEVER by the uri, which
+    # WebKit CANONICALISES before reporting it: 'http://h:p' gains a '/',
+    # 'HTTP://' lowercases, '/./x' collapses, a query space becomes '%20'. Each
+    # of those missed its parked entry, so the download was cancelled as
+    # destination-less and the callback sat there until quit. Identity also makes
+    # two concurrent downloads of the same uri distinct by construction.
+    my $dl = eval { $self->{view}->download_uri($uri) };
+    if (!$dl) {
         my $err = $@ || 'download failed to start';
-        pop @{ $self->{_dl_want}{$uri} };
-        delete $self->{_dl_want}{$uri} unless @{ $self->{_dl_want}{$uri} };
-        $self->_defer_final($cb, undef, "download: $err") if $cb;
-    };
+        $self->_defer_final($cb, undef, "download: " . _clean($err)) if $cb;
+        return $self;
+    }
+    # download-started is asynchronous on this engine, so the wrapper does not
+    # exist yet and the request is parked for the handler to claim. Should a
+    # future WebKit raise it synchronously from inside download_uri, the
+    # wrapper is already indexed -- apply to it directly rather than parking an
+    # entry no signal will ever come back for.
+    my $addr = refaddr $dl;
+    if (my $d = $self->{_dl_native}{$addr}) {
+        $d->save_to($path);
+        $d->on_finish($cb) if $cb;
+        return $self;
+    }
+    # Hold the native strongly: it pins the address, so a later download cannot
+    # be allocated at the same one and claim this entry.
+    $self->{_dl_want}{$addr} = { dest => $path, cb => $cb, dl => $dl };
     return $self;
 }
 
@@ -2722,14 +2889,22 @@ sub _teardown {
     # _flush already invokes each owed callback as ->(undef, 'browser closed'),
     # which is exactly on_finish's ($path, $err) signature, so the raw callback
     # goes straight in.
+    delete $self->{_dl_native};                           # the by-identity index; the wrappers themselves are handled just below
     for my $d (values %{ delete $self->{_downloads} || {} }) {
         eval { $d->{dl}->cancel };
         $d->{done} = 1;                                   # a late native signal now finds nothing to deliver
+        $d->_unhook;                                      # ...and break the closure cycle, or the wrapper outlives us
+        # Record the verdict on the wrapper too, not just in the callback we are
+        # about to flush: a caller still holding this object can register
+        # on_finish AFTER the close, and that late registration delivers from
+        # {path}/{err}. Leaving them unset would report (undef, undef) -- a
+        # successful download to nowhere, which reads as success.
+        $d->{err} = 'browser closed';
         push @owed, delete $d->{on_finish} if $d->{on_finish};
     }
     # ...and requests parked by download() that never reached download-started.
-    for my $q (values %{ delete $self->{_dl_want} || {} }) {
-        push @owed, grep { defined } map { $_->{cb} } @$q;
+    for my $want (values %{ delete $self->{_dl_want} || {} }) {
+        push @owed, $want->{cb} if $want->{cb};
     }
     # Still inside a WebKit dispatch frame? Then these callbacks must not run
     # HERE. quit() defers the whole teardown for exactly that reason -- but it
@@ -2879,7 +3054,11 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
     sub _new {
         my ($class, $browser, $dl) = @_;
         Scalar::Util::weaken(my $b = $browser);   # the browser owns us; do not own it back
-        return bless { b => $b, dl => $dl, seq => ++$SEQ, overwrite => 0 }, $class;
+        # `native` is the browser's {_dl_native}/{_dl_want} key -- the identity
+        # of the WebKitDownload, which is what download() matches on (its uri
+        # is not stable enough; see download()).
+        return bless { b => $b, dl => $dl, native => Scalar::Util::refaddr($dl),
+                       seq => ++$SEQ, overwrite => 0 }, $class;
     }
 
     sub uri       { eval { $_[0]{dl}->get_request->get_uri } }
@@ -2890,16 +3069,47 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
 
     # Choose where this download lands. Called from on_download; without it the
     # download is cancelled rather than written to WebKit's default directory.
+    # Shared with EV::WebKit::download, so a destination that this would reject
+    # is rejected THERE -- synchronously, at the caller's own call site -- rather
+    # than later, from inside the download-started signal handler where a croak
+    # escapes into GLib and takes the caller's callback (and, measured, the
+    # process) with it. $what names the caller for the message.
+    sub _norm_dest {
+        my ($path, $what) = @_;
+        Carp::croak("$what: a destination path is required")
+            if !defined $path || ref $path || !length $path;
+        return $path unless $path =~ /^file:/i;
+        my $shown = $path;
+        $path =~ s{^file://}{}i
+            or Carp::croak("$what: not a local file:// URI: $shown");
+        $path =~ s{^localhost(?=/)}{}i;   # hostnames are case-insensitive, and the scheme above is stripped /i
+        Carp::croak("$what: not a local file:// URI: $shown") unless $path =~ m{^/};
+        $path =~ s/%([0-9A-Fa-f]{2})/chr hex $1/ge;
+        # %00 decodes to a NUL, which no filesystem accepts and which C -- on the
+        # other side of the GI call -- reads as end-of-string: 'file:///tmp/a%00b'
+        # would have written /tmp/a and reported success for a path the caller
+        # never asked for. Say so instead.
+        Carp::croak("$what: the decoded path contains a NUL byte: $shown")
+            if index($path, "\0") >= 0;
+        return $path;
+    }
+
     sub save_to {
         my ($s, $path, %o) = @_;
-        Carp::croak('save_to: a destination path is required') if !defined $path || ref $path || !length $path;
         # A PLAIN FILESYSTEM PATH, never a file:// URI. WebKitGTK 6.0 changed
         # webkit_download_set_destination to take a path (2.x took a URI), and
         # handing it a URI does not fail -- the download simply stalls forever,
         # emitting neither 'finished' nor 'failed', so the caller waits on a
         # callback that can never arrive. Accept a file:// URI from the caller
-        # and strip it, rather than passing that trap along.
-        $path =~ s{^file://}{};
+        # and strip it, rather than passing that trap along. Strip it PROPERLY,
+        # though: taking the prefix off and stopping there left the rest still
+        # URI-encoded, so 'file:///tmp/a%20b' wrote a file literally named
+        # 'a%20b', and 'file://localhost/x' became the relative path
+        # 'localhost/x'. Decode the escapes, accept the empty and 'localhost'
+        # authorities (both mean this machine), and refuse any other host --
+        # which names a file we cannot write and would otherwise become a
+        # nonsense relative path.
+        $path = _norm_dest($path, 'save_to');
         $s->{dest}      = $path;
         $s->{overwrite} = $o{overwrite} ? 1 : 0;
         return $s;
@@ -2929,7 +3139,27 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
         # Release the browser's retention of this wrapper; the callback above
         # has already been handed everything it needs.
         my $b = $s->{b};
-        delete $b->{_downloads}{ $s->{seq} } if $b;
+        if ($b) {
+            delete $b->{_downloads}{ $s->{seq} };
+            delete $b->{_dl_native}{ $s->{native} };
+        }
+        $s->_unhook;
+        return;
+    }
+
+    # Drop the native's references to our three signal closures. Each of them
+    # captures $s, and $s holds the native as {dl}: a cycle refcounting cannot
+    # collect, so every completed download used to keep both alive until the
+    # process exited (measured: 3 of 3 wrappers still reachable after finishing).
+    # Disconnecting from inside one of those handlers' own emission is
+    # supported by GLib -- the handler is marked and removed after it returns.
+    # The accessors stay usable afterwards: {dl} is untouched, only the
+    # subscriptions go.
+    sub _unhook {
+        my $s = shift;
+        my $ids = delete $s->{sig} or return;
+        my $dl  = $s->{dl}         or return;
+        eval { $dl->signal_handler_disconnect($_) } for @$ids;
         return;
     }
 
@@ -2941,8 +3171,29 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
         # Deferred like every other callback: _finish runs inside WebKit's own
         # signal dispatch, and calling user code (which may call EV::break) from
         # there is the documented lifecycle wedge.
-        if ($b) { $b->_defer($cb, $path, $err) }
-        else    { eval { $cb->($path, $err); 1 } or warn "EV::WebKit: download on_finish died: $@" }
+        #
+        # _defer is dead-gated, so it silently swallows anything delivered after
+        # quit(). That is right for an op still in flight (quit already flushed
+        # its callback) but WRONG here: a caller holding this object can call
+        # on_finish AFTER the browser closed -- teardown marked us done, so we
+        # land straight in this branch -- and the answer simply vanished. Use
+        # the un-gated final registry once the browser is dead, which is the
+        # same route every other post-quit call takes to report 'browser
+        # closed'.
+        #
+        # _op_track before _defer, so the deferral is not the ONLY thing holding
+        # this answer. _finish drops the wrapper from {_downloads} the moment it
+        # runs, and quit() cancels every pending _defer timer -- so a quit()
+        # landing in the window between them found nothing owed in either place
+        # and the callback vanished (reproduced: quit() from a watcher in the
+        # same loop iteration as 'finished'). Every other async op here is
+        # already tracked for exactly this reason; downloads were not.
+        # _flush delivers as ->(undef, 'browser closed'), which is on_finish's
+        # own ($path, $err) shape, and the tracker's dedupe means whichever of
+        # the two arrives first is the only one the caller sees.
+        if    ($b && !$b->{_dead}) { $b->_defer($b->_op_track($cb), $path, $err) }
+        elsif ($b)                 { $b->_defer_final($cb, $path, $err) }
+        else { eval { $cb->($path, $err); 1 } or warn "EV::WebKit: download on_finish died: $@" }
         return;
     }
 }
@@ -3570,11 +3821,48 @@ an input's value untouched. Use L<EV::WebKit::Element/type> to edit a field.
 This is stated plainly because the opposite assumption is the natural one and it
 fails silently.
 
+As in a real browser, C<keypress> is sent only for keys that produce a
+character -- which includes C<Enter>, since it produces a carriage return, and
+is why C<< onkeypress >> handlers testing for C<keyCode> 13 work -- and not at
+all if the keydown was cancelled. C<keyup> goes to whatever has focus when it
+is sent, not to whatever had it at C<keydown>, so a handler that moves focus
+(the usual thing for C<Tab> and C<Enter>) behaves as it does under a real key.
+
+C<keyCode> and C<event.code> both carry what a real browser sends, and come
+from one table so they cannot disagree:
+
+=over 4
+
+=item *
+
 Named keys (C<Enter>, C<Escape>, C<Tab>, C<Backspace>, C<Delete>, the arrows,
-C<Home>, C<End>, C<PageUp>, C<PageDown>) carry the C<keyCode> a listener is
-likely to check; a single character gets its uppercase ordinal. As in a real
-browser, C<keypress> is sent only for character keys, and not at all if the
-keydown was cancelled.
+C<Home>, C<End>, C<PageUp>, C<PageDown>) get their usual C<keyCode>, and the
+name itself as C<code>.
+
+=item *
+
+A letter gets its uppercase ordinal and C<KeyQ>; a digit its ordinal and
+C<Digit5>.
+
+=item *
+
+ASCII punctuation gets the legacy US-layout value -- C<.> is 190 and C<Period>,
+C<'> is 222 and C<Quote>, and so on for C<,> C<;> C</> C<-> C<=> C<[> C<]>
+C<\> C<`> and space.
+
+=item *
+
+A shifted character such as C<!>, or any non-ASCII one, names no physical key
+by itself: which key produced it depends on the layout. Those report C<code>
+C<''> and C<keyCode> C<0> -- the pair a browser uses for a key it cannot
+identify.
+
+=back
+
+That last case is why they are not simply derived from the character. The
+obvious derivation, the character's ordinal, does not merely give a wrong
+number -- it gives one that B<impersonates another key>: C<ord('.')> is 46,
+which is C<Delete>, and C<< ord("'") >> is 39, which is C<ArrowRight>.
 
 =head3 scroll
 
@@ -3586,6 +3874,13 @@ keydown was cancelled.
 Scrolls the page and resolves with the resulting C<< { x, y } >>. C<to =>
 'bottom'> computes the document height rather than guessing a large number,
 which is what makes it reliable for lazy-loading pages.
+
+The scroll is B<instant>, and deliberately overrides the page's own CSS
+C<scroll-behavior: smooth> if it has one. Under that property the scroll is an
+animation: it has not happened yet when the callback runs, so the reported
+position would be the one you started from and anything you did next -- a
+screenshot, a L<EV::WebKit::Element/box> -- would see the old viewport.
+L<EV::WebKit::Element/scroll_into_view> does the same.
 
 =head2 Elements
 
@@ -3663,6 +3958,20 @@ JavaScript error:
 
 The expression is evaluated in the page's own world, as C<script> does, so it
 sees the page's globals.
+
+B<Truthiness is JavaScript's, not Perl's.> The verdict is reached in the page
+and sent back beside the value, so the two languages cannot disagree about it:
+the string C<"0"> is true here, as it is in JavaScript, and a function is true
+even though it has no JSON representation. That last point is what makes the
+most common form of this call work at all --
+
+    $b->wait_for_js('window.jQuery', sub { ... });   # a function
+
+-- and the price is that C<$value> is C<undef> for such a value: the wait
+succeeds, but there is nothing meaningful to marshal back. The same holds for
+anything else JSON cannot carry -- a BigInt, or an object containing a cycle,
+which most framework objects do. Wait on the expression you care about, and
+read what you need afterwards.
 
 =head2 Downloads and file upload
 

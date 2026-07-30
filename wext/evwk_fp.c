@@ -794,22 +794,43 @@ static const char *PLUGINS_JS =
     "(function(){"
     "  var C; try{ C=JSON.parse(window.__evwk_cfg); }catch(e){ return; }"
     "  if(!C || !C.no_pdf_viewer) return;"
+    /* A replacement inherits neither the original's name nor its arity, and a
+     * function expression carries an own `prototype` where a real WebIDL method
+     * has none. All three are plain property reads -- no
+     * Function.prototype.toString -- so they sit OUTSIDE the documented ceiling.
+     * Method SHORTHAND fixes the prototype; the two defineProperty calls fix the
+     * rest. The wrapper forwards `this`, so the brand check still sees the real
+     * receiver. */
+    "  var mimic=function(fn,orig,name){"
+    "    var m=({ m(){ return fn.apply(this,arguments); } }).m;"
+    "    try{ Object.defineProperty(m,'name',{value:name,configurable:true}); }catch(e){}"
+    "    try{ Object.defineProperty(m,'length',{value:orig.length,configurable:true}); }catch(e){}"
+    "    return m; };"
     "  var mk=function(ctor){"
     "    if(typeof ctor!=='function'||!ctor.prototype) return null;"
     "    var inst=Object.create(ctor.prototype);"
     /* Patch each brand-checking member once: answer the empty-list value for
-     * `inst`, delegate to the original for every real instance. */
-    "    ['length','item','namedItem'].forEach(function(k){"
+     * `inst`, delegate to the original for every real instance.
+     *
+     * refresh() brand-checks like the rest: on the fake it threw "Can only call
+     * PluginArray.refresh on instances of PluginArray" where Chrome returns
+     * undefined -- breaking page JS and announcing the spoof in one call, and
+     * calling it is what a plugin-probing script does. (MimeTypeArray has none;
+     * the getOwnPropertyDescriptor guard below skips it there.) */
+    "    ['length','item','namedItem','refresh'].forEach(function(k){"
     "      var d=Object.getOwnPropertyDescriptor(ctor.prototype,k); if(!d) return;"
     "      if(d.get){"
     "        var og=d.get;"
-    "        Object.defineProperty(ctor.prototype,k,{enumerable:d.enumerable,configurable:true,"
-    "          get:function(){ return this===inst ? 0 : og.call(this); }});"
+    "        var g=mimic(function(){ return this===inst ? 0 : og.call(this); }, og, 'get '+k);"
+    "        Object.defineProperty(ctor.prototype,k,{enumerable:d.enumerable,configurable:true,get:g});"
     "      } else if(typeof d.value==='function'){"
     "        var ov=d.value;"
+    /* refresh returns undefined; item/namedItem return null on an empty list. */
+    "        var v=mimic(function(){"
+    "          if(this!==inst) return ov.apply(this,arguments);"
+    "          return k==='refresh' ? undefined : null; }, ov, k);"
     "        Object.defineProperty(ctor.prototype,k,{enumerable:d.enumerable,configurable:true,"
-    "          writable:d.writable,"
-    "          value:function(){ return this===inst ? null : ov.apply(this,arguments); }});"
+    "          writable:d.writable,value:v});"
     "      } });"
     "    return inst; };"
     "  var pa=mk(window.PluginArray), ma=mk(window.MimeTypeArray);"

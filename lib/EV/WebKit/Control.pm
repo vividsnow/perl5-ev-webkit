@@ -6,7 +6,7 @@ use warnings;
 use Carp ();
 use Errno ();
 use EV;
-use IO::Socket::UNIX;
+use IO::Socket::UNIX ();   # () like every other import here: its Socket re-exports would otherwise land in this package as callable methods
 use MIME::Base64 ();
 use Scalar::Util qw(weaken);
 use EV::WebKit::Protocol;
@@ -25,7 +25,7 @@ our $VERSION = '0.04';
 
 # Methods that answer immediately.
 my %SYNC = map { $_ => 1 } qw(
-    uri title is_loading user_agent can_go_back can_go_forward
+    uri title is_loading user_agent can_go_back can_go_forward status
     stop settings set_user_agent set_proxy show_devtools
 );
 
@@ -39,27 +39,33 @@ my %SYNC = map { $_ => 1 } qw(
 #   screenshot -- its first argument is either a path OR an options hashref, a
 #     distinction the generic option-flattening destroys, and in bytes mode its
 #     result is raw PNG octets that must be base64'd to survive JSON.
+#   scroll -- its callback is a NAMED option (cb => ...), not a trailing
+#     argument, so the generic (@a, %o, $cb) call below would flatten the
+#     callback into %o as a stray odd element. Dispatched separately.
 my %ASYNC = map { $_ => 1 } qw(
     go load_html back forward reload
     script script_async html pdf
+    press download wait_for_js
     set_cookie cookies clear_cookies save_cookies load_cookies
 );
 
-# EV::WebKit::Element's methods, reachable as el.<name> with a handle, and how
-# many arguments each one needs BEFORE its callback.
+# EV::WebKit::Element's methods, reachable as el.<name> with a handle, and the
+# [min, max] arguments each takes BEFORE its callback.
 #
-# The count is load-bearing, not documentation. These methods bind positionally
-# (`my ($s, $n, $cb) = @_`), not by popping the callback off the end -- so a
-# request one argument short would put the callback we append into the NAME slot
-# and leave the real callback undef. The call then quietly does nothing (a
-# callback-less call is legal), the coderef ends up handed to the JSON encoder,
-# and the request is never answered at all: a client hung forever, which is the
-# one failure mode this protocol must not have. Check the arity and answer with
-# an error instead.
+# Both bounds are load-bearing. These methods bind positionally rather than
+# popping the callback off the end, so a wrong count shifts the callback slot:
+# one SHORT leaves the real callback undef (and a callback-less call is legal,
+# so nothing complains); one LONG pushes it past the end, where most methods
+# croak but uncheck's `my ($s, $cb) = @_` takes the junk silently. Either way
+# nothing answers and the client hangs until the socket closes.
 my %EL_METHOD = (
-    text => 0, html => 0, value => 0, tag => 0, is_visible => 0,
-    click => 0, focus => 0, clear => 0, submit => 0,
-    attr => 1, prop => 1, type => 1, find => 1, find_all => 1,
+    text => [0,0], html => [0,0], value => [0,0], tag => [0,0], is_visible => [0,0],
+    click => [0,0], focus => [0,0], clear => [0,0], submit => [0,0],
+    scroll_into_view => [0,0], hover => [0,0], box => [0,0], uncheck => [0,0],
+    check => [0,1],                       # the state is optional
+    attr => [1,1], prop => [1,1], type => [1,1], find => [1,1], find_all => [1,1],
+    select_option => [1,1],
+    send_keys => [1,1],   # a glob alias for type, and the only alias in the dist
 );
 
 sub listen {
@@ -216,7 +222,15 @@ sub _add_client {
         # side effects would run and the answer would go nowhere, which is a
         # silently dropped request -- a hung client.
         for my $f ($c->{dec}->($buf)) {
-            $s->_dispatch($id, $f);
+            # Guarded per FRAME: a die inside _dispatch escapes into the read
+            # watcher, losing this frame's answer AND every sibling decoded from
+            # the same sysread. The known cause is fixed at its source, but a
+            # whole batch is too much to lose to any future unguarded path.
+            unless (eval { $s->_dispatch($id, $f); 1 }) {
+                my $e = _clean($@) || 'internal error';
+                warn "EV::WebKit::Control: dispatch died: $e";
+                eval { $s->_send($id, { i => $f->{i}, e => $e }) };
+            }
             last unless exists $s->{clients}{$id};
         }
     });
@@ -339,6 +353,16 @@ sub _dispatch {
 
     my $rid = $f->{i};
     my $m   = $f->{m} // '';
+    # SHAPE, not just presence: `// []` guards a MISSING field and does nothing
+    # about a present one of the wrong type, and @{ $hashref } is a fatal "Not an
+    # ARRAY reference" thrown inside the read watcher where nothing catches it.
+    # So {"a":{}} went unanswered and took every frame decoded from the same
+    # sysread with it.
+    for my $bad ([a => 'ARRAY', 'an array'], [o => 'HASH', 'an object']) {
+        my ($k, $want, $shown) = @$bad;
+        next if !defined $f->{$k} || ref $f->{$k} eq $want;
+        return $self->_send($id, { i => $rid, e => "'$k' must be $shown" });
+    }
     my @a   = @{ $f->{a} // [] };
     my %o   = %{ $f->{o} // {} };
     my $b   = $self->{browser};
@@ -408,16 +432,27 @@ sub _dispatch {
     }
 
     if ($m eq 'el.release') {
-        delete $self->{handles}{ $f->{h} // '' };
+        # Ownership checked HERE too: this branch returns before the check below,
+        # whose own comment names el.release as a case it covers -- so it did
+        # not, and handle ids are small sequential integers. Answer as though the
+        # handle is not there, which for this client it is not.
+        my $h   = $f->{h} // '';
+        my $rec = $self->{handles}{$h};
+        return $answer->(undef, 'stale element')
+            unless $rec && defined $rec->{client} && $rec->{client} == $id;
+        delete $self->{handles}{$h};
         return $answer->(1);
     }
 
     if (index($m, 'el.') == 0) {
         my $em = substr($m, 3);
         return $answer->(undef, "unknown method: $m") unless exists $EL_METHOD{$em};
-        my $need = $EL_METHOD{$em};
-        return $answer->(undef, "$m: expected $need argument" . ($need == 1 ? '' : 's') . ", got " . scalar(@a))
-            if @a < $need;
+        my ($min, $max) = @{ $EL_METHOD{$em} };
+        if (@a < $min || @a > $max) {
+            my $want = $min == $max ? $min : "$min to $max";
+            return $answer->(undef,
+                "$m: expected $want argument" . ($max == 1 && $min == 1 ? '' : 's') . ', got ' . scalar(@a));
+        }
         my $rec = $self->{handles}{ $f->{h} // '' };
         # A handle belongs to the client that made it. Handle ids are small
         # sequential integers, so without this a client could reach another's
@@ -443,6 +478,14 @@ sub _dispatch {
         return $answer->(undef, _clean($@)) if $@;
         $r = 1 if ref $r;                    # a mutator returns $b; do not try to serialize a browser
         return $answer->($r);
+    }
+
+    # scroll's callback is a named option: passed positionally it would land in
+    # %o as a stray odd element.
+    if ($m eq 'scroll') {
+        my $ok = eval { $b->scroll(@a, %o, cb => sub { $answer->(@_) }); 1 };
+        return $answer->(undef, _clean($@)) unless $ok;
+        return;
     }
 
     if ($ASYNC{$m}) {

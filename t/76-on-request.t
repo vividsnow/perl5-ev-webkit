@@ -90,20 +90,89 @@ plan skip_all => 'on_request needs Proxy::Impersonate 0.04 (the hook it relies o
     like($got, qr{content-length: 11}i,   'content-length is computed from the synthetic body');
 }
 
-# --- on_response is wired through the same proxy -------------------------
+# --- on_response, end to end -------------------------------------------------
+#
+# This used to construct a browser, assert proxy_port was defined and quit --
+# so the handler was never invoked and the assertion could not have failed if
+# on_response did nothing at all, which is exactly how a stale install of the
+# proxy hid once already.
+#
+# It can be driven for real: WebKit's local-address bypass is a rule about how
+# WEBKIT routes, and has no bearing on what the proxy forwards when spoken to
+# directly. So point the proxy at a local origin and check the whole path --
+# the hook sees the origin's real status, its edit reaches the client, and the
+# origin's own headers and body survive the round trip.
 {
+    my $origin = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
+                                       Listen => 5, ReuseAddr => 1)
+        or plan skip_all => "cannot bind an origin socket: $!";
+    my $oport = $origin->sockport;
+    my (%oconn, $hits);
+    $hits = 0;
+    my $oacc = EV::io($origin, EV::READ, sub {
+        my $c = $origin->accept or return;
+        $c->blocking(0);
+        my $buf = '';
+        my $rw; $rw = EV::io($c, EV::READ, sub {
+            my $n = sysread($c, my $ch, 4096);
+            if (!defined $n) { return if $!{EAGAIN} || $!{EWOULDBLOCK}; delete $oconn{$c}; return }
+            return delete $oconn{$c} unless $n;
+            $buf .= $ch;
+            return unless $buf =~ /\r?\n\r?\n/;
+            delete $oconn{$c};
+            $hits++;
+            my $body = 'ORIGIN-BODY';
+            print $c "HTTP/1.1 203 Non-Authoritative\r\nContent-Type: text/plain\r\n"
+                   . "X-From-Origin: yes\r\nContent-Length: " . length($body) . "\r\n"
+                   . "Connection: close\r\n\r\n$body";
+            close $c;
+        });
+        $oconn{$c} = $rw;
+    });
+
     my @seen;
     my $b = EV::WebKit->new(window => [200,150],
-        on_request  => sub { return },
+        on_request  => sub { return },                    # pass through, do not mock
         on_response => sub {
             my ($res) = @_;
-            push @seen, { status => $res->{status}, host => $res->{host} };
-            $res->{headers}{"x-seen-by-test"} = "1";
+            push @seen, { status => $res->{status} };
+            $res->{headers}{'x-added-by-hook'} = 'yes';
             return;
         },
     );
-    ok(defined $b->proxy_port, "on_response alone also spins the proxy");
+    ok(defined $b->proxy_port, 'on_response also spins the interception proxy');
+
+    my $sock = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $b->proxy_port,
+                                     Proto => 'tcp', Timeout => 5)
+        or plan skip_all => "cannot connect to the interception proxy: $!";
+    $sock->blocking(0);
+    my $req = "GET http://127.0.0.1:$oport/thing HTTP/1.1\r\nHost: 127.0.0.1:$oport\r\n"
+            . "Connection: close\r\n\r\n";
+    my $got = '';
+    my $ww; $ww = EV::io($sock, EV::WRITE, sub {
+        my $n = syswrite($sock, $req);
+        if (defined $n) { substr($req, 0, $n, ''); undef $ww unless length $req }
+    });
+    my $rw = EV::io($sock, EV::READ, sub {
+        my $n = sysread($sock, my $buf, 8192);
+        return unless defined $n;
+        if ($n == 0) { EV::break; return }
+        $got .= $buf;
+        EV::break if $got =~ /ORIGIN-BODY/;
+    });
+    my $t = EV::timer(20, 0, sub { EV::break });
+    EV::run;
+    undef $ww; undef $rw; undef $t; undef $oacc;
+    close $sock;
     $b->quit;
+
+    is($hits, 1, 'the proxy really forwarded to the origin (nothing was mocked)');
+    is(scalar @seen, 1, 'on_response fired for the forwarded response')
+        or diag('the hook was not reached at all');
+    is($seen[0]{status}, 203, "...and sees the origin's real status");
+    like($got, qr/x-added-by-hook:\s*yes/i, "the hook's added header reached the client");
+    like($got, qr/x-from-origin:\s*yes/i,   "...and the origin's own headers survived");
+    like($got, qr/ORIGIN-BODY/,             '...as did the body');
 }
 
 # on_response accepts only a coderef, and conflicts with an explicit proxy,

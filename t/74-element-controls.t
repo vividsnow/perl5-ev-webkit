@@ -22,6 +22,7 @@ my $fixture = <<'HTML';
   <option value="a">Alpha</option>
   <option value="b">Beta</option>
   <option value="">Blank Label</option>
+  <option value="5">Five</option>
 </select>
 <input type=checkbox id=cb>
 <input type=radio name=r id=r1>
@@ -33,6 +34,10 @@ my $fixture = <<'HTML';
   document.getElementById('cb').addEventListener('change',  () => window.__ev.cb++);
   for (const t of ['mouseover','mouseenter','mousemove','pointerover','pointerenter'])
     document.getElementById('hov').addEventListener(t, () => window.__ev.hov.push(t));
+  // the DEVICE a pointer event claims to come from -- see the assertions
+  window.__ev.ptr = null;
+  document.getElementById('hov').addEventListener('pointerover',
+    e => window.__ev.ptr = [e.pointerType, e.pointerId, e.isPrimary]);
 </script>
 HTML
 
@@ -63,6 +68,15 @@ step('find' => sub {
 step('select_option by value' => sub {
     my $next = shift;
     $el{'#sel'}->select_option('b', sub { ($g{sel_val}, $g{sel_err}) = @_; $next->() });
+});
+
+# A NUMBER where the DOM keeps a string. An option's value is always a string
+# and the match is ===, which does not coerce, so an unstringified 5 encoded as
+# a JSON number matched nothing -- select_option(5) failed on <option value="5">
+# while select_option('5') worked. Perl draws no such distinction anywhere else.
+step('select_option with a numeric value' => sub {
+    my $next = shift;
+    $el{'#sel'}->select_option(5, sub { ($g{num_val}, $g{num_err}) = @_; $next->() });
 });
 
 step('select_option by label' => sub {
@@ -134,8 +148,11 @@ is($g{sel_err}, undef, 'select_option: no error');
 is($g{sel_val}, 'b',   'select_option returns the selected value');
 is($g{lbl_val}, '',    'select_option matches by visible LABEL when no value matches');
 is($g{lbl_err}, undef, 'select_option by label: no error');
+is($g{num_err}, undef, 'select_option accepts a NUMBER for a string option value')
+    or diag('=== does not coerce: an unstringified 5 never matches value="5"');
+is($g{num_val}, '5',   '...and reports the value it selected');
 is($st->{selValue}, '', 'the <select> really holds the label-matched option');
-is($st->{ev}{sel}, 2,  'each select_option fired exactly one change event');
+is($st->{ev}{sel}, 3,  'each select_option fired exactly one change event');
 
 # --- check / uncheck ---
 is($g{chk1}, 1, 'check() reports checked');
@@ -159,6 +176,14 @@ ok($seen{mousemove},  'hover fires mousemove');
 # mouseenter does NOT bubble -- a naive implementation that only dispatches
 # mouseover misses it, and a menu that opens on mouseenter would never open
 ok($seen{mouseenter}, 'hover fires mouseenter (the non-bubbling one)');
+
+# ...and the pointer events claim a MOUSE. Built without these, a PointerEvent
+# reports pointerType "" and isPrimary false, so a menu that branches on the
+# device -- `if (e.pointerType !== "touch")`, or a guard on isPrimary -- took the
+# wrong branch or none at all, which is the very class of menu hover exists for.
+is(($st->{ev}{ptr} || [])->[0], 'mouse', 'hover reports pointerType "mouse", not ""');
+is(($st->{ev}{ptr} || [])->[1], 1,       '...a real pointerId');
+ok(($st->{ev}{ptr} || [])->[2],          '...and isPrimary true');
 
 # --- scroll_into_view ---
 is($g{scr_err}, undef, 'scroll_into_view: no error');

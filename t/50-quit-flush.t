@@ -36,8 +36,20 @@ $b->go('q://p', sub {
     $b->set_cookie({name=>'a',value=>'b',domain=>'example.com'}, $rec->('set_cookie'));
     $b->clear_cookies(                   $rec->('clear_cookies'));
     $b->save_cookies($SAVE, ['http://example.com/'], $rec->('save_cookies'));
+    # The 0.04 op families. This battery's whole premise is that EVERY op
+    # family is flushed, and these four were added to the module without being
+    # added here. They also exercise two different flush paths: press/scroll
+    # and download resolve through {_ops} and the download registries, while
+    # wait_for/wait_for_js resolve through {_waiters}.
+    # download needs no server: quit lands in this same tick, so the request is
+    # still parked, unclaimed, and it is the parked entry that must be flushed.
+    $b->download('http://127.0.0.1:1/never', '/tmp/evwk-flush-test.bin', $rec->('download'));
+    $b->press('Enter',                   $rec->('press'));
+    $b->scroll(y => 10, cb =>            $rec->('scroll'));
+    $b->wait_for('#never-there',         $rec->('wait_for'));
+    $b->wait_for_js('window.never',      $rec->('wait_for_js'));
 
-    $b->quit;    # tear down while all ten are in flight
+    $b->quit;    # tear down while all fifteen are in flight
 
     # let any stray late completion try (and fail) to deliver a second time
     EV::timer(2, 0, sub { EV::break });
@@ -49,7 +61,8 @@ undef $wd;
 
 ok($ready, 'setup: navigated') or BAIL_OUT('no page');
 
-my @ops = qw(find find_all script script_async html screenshot cookies set_cookie clear_cookies save_cookies);
+my @ops = qw(find find_all script script_async html screenshot cookies set_cookie clear_cookies save_cookies
+             download press scroll wait_for wait_for_js);
 for my $op (@ops) {
     ok($fired{$op}, "$op: in-flight callback fired after quit (not silently dropped)")
         or diag("$op callback never fired");

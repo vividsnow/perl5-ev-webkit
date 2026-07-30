@@ -20,7 +20,8 @@ sub handle { $_[0]{h} }
 # text/html/value/tag/attr/prop/is_visible/click/focus/type/clear/submit all take
 # (@args, $cb?) and return a plain value. find/find_all return handles, so they
 # are generated separately below.
-for my $m (qw(text html value tag attr prop is_visible click focus type clear submit)) {
+for my $m (qw(text html value tag attr prop is_visible click focus type clear submit
+              scroll_into_view hover box check uncheck select_option send_keys)) {
     no strict 'refs';
     *{__PACKAGE__ . "::$m"} = sub {
         my $self = shift;

@@ -245,6 +245,67 @@ CHILD
             : "child exit=$rc, output: $out");
 }
 
+# --- a frame whose fields are valid JSON but the wrong SHAPE ---
+#
+# `// []` guards a MISSING field and does nothing about a present one of the
+# wrong type: @{ $hashref } is a fatal "Not an ARRAY reference", thrown inside
+# the read watcher where nothing catches it. So {"a":{}} -- a plausible bug in
+# any client -- went unanswered AND took every request decoded from the same
+# sysread with it. One bad frame poisoning a batch of good ones is the
+# never-answered-request class this protocol must not have.
+{
+    my $c = IO::Socket::UNIX->new(Peer => $path) or die "connect: $!";
+    # both frames in ONE write, so they decode from a single sysread
+    $c->syswrite(EV::WebKit::Protocol::encode({ i => 901, m => 'title', a => {} })
+               . EV::WebKit::Protocol::encode({ i => 902, m => 'title' }));
+    $c->blocking(0);
+    my $buf = '';
+    my $deadline = EV::time + 20;
+    until (($buf =~ /"i":901/ && $buf =~ /"i":902/) || EV::time > $deadline) {
+        my $n = sysread($c, my $chunk, 4096);
+        $buf .= $chunk if defined $n && $n;
+        my $t = EV::timer(0.05, 0, sub { EV::break }); EV::run;
+    }
+    like($buf, qr/"i":901/, 'a frame with a wrong-shaped field is answered, not dropped');
+    like($buf, qr/'a' must be an array/, '...saying which field and what it should be');
+    like($buf, qr/"i":902/, '...and the valid frame behind it in the same batch still answers')
+        or diag('one bad frame poisoned the whole read');
+    close $c;
+}
+
+# --- a client must not be able to release another client's handle ---
+#
+# The ownership check further down names el.release as a case it covers -- but
+# el.release returned before reaching it. Handle ids are small sequential
+# integers, so guessing takes no effort.
+{
+    my $owner = IO::Socket::UNIX->new(Peer => $path) or die "connect: $!";
+    my $other = IO::Socket::UNIX->new(Peer => $path) or die "connect: $!";
+    $owner->syswrite(EV::WebKit::Protocol::encode({ i => 910, m => 'find', a => ['h1'] }));
+    my $before = scalar keys %{ $ctl->{handles} };
+    my $deadline = EV::time + 20;
+    while (scalar(keys %{ $ctl->{handles} }) <= $before && EV::time < $deadline) {
+        my $t = EV::timer(0.05, 0, sub { EV::break }); EV::run;
+    }
+    my ($h) = sort { $b <=> $a } keys %{ $ctl->{handles} };
+    ok(defined $h, 'precondition: the owning client took a handle')
+        or diag('no handle was created -- the rest of this block would prove nothing');
+
+    $other->syswrite(EV::WebKit::Protocol::encode({ i => 911, m => 'el.release', h => $h }));
+    my $reply = '';
+    $other->blocking(0);
+    $deadline = EV::time + 20;
+    until ($reply =~ /"i":911/ || EV::time > $deadline) {
+        my $n = sysread($other, my $chunk, 4096);
+        $reply .= $chunk if defined $n && $n;
+        my $t = EV::timer(0.05, 0, sub { EV::break }); EV::run;
+    }
+    like($reply, qr/stale element/, "a client cannot release another client's handle");
+    ok(exists $ctl->{handles}{$h}, "...and the owner's handle is still there")
+        or diag('the handle was released out from under its owner');
+    close $owner; close $other;
+}
+
 $ctl->close;
 $b->quit;
 done_testing;

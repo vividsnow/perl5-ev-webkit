@@ -5,6 +5,7 @@ use EV; use EV::WebKit;
 use File::Temp qw(tempdir);
 use File::Spec;
 use IO::Socket::INET;
+use Scalar::Util ();   # weaken, for the collectability check below
 
 # download() / on_download / on_file_chooser.
 #
@@ -27,6 +28,7 @@ my $srv = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
     or plan skip_all => "cannot bind a test server socket: $!";
 my $port = $srv->sockport;
 my %conns;
+my @stalled;   # sockets deliberately left unanswered -- see /slow below
 my $accept_io = EV::io($srv, EV::READ, sub {
     my $c = $srv->accept or return;
     $c->blocking(0);
@@ -38,6 +40,27 @@ my $accept_io = EV::io($srv, EV::READ, sub {
         $buf .= $chunk;
         return unless $buf =~ /\r?\n\r?\n/;
         delete $conns{$c};
+        # /slow sends HEADERS and then stops. The headers are what make WebKit
+        # raise decide-destination (so the download is a real, started one that
+        # on_download sees), and the missing body is what keeps it in flight
+        # afterwards -- announce a megabyte, send a handful of bytes, never
+        # close. @stalled holds the socket: dropping it here would close the
+        # connection and turn the stall into an immediate failure.
+        # The 64 KiB matters: WebKit buffers the start of a response and does not
+        # raise decide-destination until it has enough, so a token handful of
+        # bytes leaves the download started but never destined, and on_download
+        # is never called. Blocking for this one write (the read watcher is gone
+        # by now) because a short write would strand it the same way; 64 KiB
+        # fits a socket buffer and WebKit is reading the other end.
+        if ($buf =~ m{^\S+\s+/slow\b}) {
+            $c->blocking(1);
+            print $c "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                   . "Content-Disposition: attachment; filename=\"slow.bin\"\r\n"
+                   . "Content-Length: 1000000\r\n\r\n" . ('S' x 65536);
+            $c->flush;
+            push @stalled, $c;
+            return;
+        }
         my $body = 'HELLO-DOWNLOAD';
         print $c "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
                . "Content-Disposition: attachment; filename=\"served.bin\"\r\n"
@@ -69,14 +92,50 @@ my $URL = "http://127.0.0.1:$port/served.bin";
 # in the user's Downloads directory behind the caller's back. ---
 {
     my $b = EV::WebKit->new(window => [200, 150]);
-    my ($seen_uri, $err);
-    $b->on_download(sub { $seen_uri = $_[0]->uri; $_[0]->on_finish(sub { $err = $_[1]; EV::break }) });
+    my ($seen_uri, $err, $calls);
+    $calls = 0;
+    $b->on_download(sub { $seen_uri = $_[0]->uri;
+                          $_[0]->on_finish(sub { $err = $_[1]; $calls++; EV::break }) });
     $b->{view}->download_uri($URL);
     TWK::run_with_timeout(20);
+    # a moment more, so a second delivery would have somewhere to land
+    my $t = EV::timer(0.5, 0, sub { EV::break }); EV::run; undef $t;
     $b->quit;
 
     like($seen_uri // '', qr{^http://127\.0\.0\.1:}, 'on_download sees a page-initiated download');
     like($err // '', qr/no destination/, 'a download with no destination is cancelled, not written');
+    # WebKit emits 'finished' as the terminal event of EVERY download, including
+    # one it just cancelled -- so _finish runs twice here. Without its once-only
+    # guard the caller is called twice, and the second call's (dest, undef) would
+    # overwrite the cancel's reason with a phantom success.
+    is($calls, 1, '...exactly once, though WebKit also emits finished after the cancel');
+}
+
+# --- 2b) ...and the verdict recorded on the wrapper is the CANCEL's, not the
+# 'finished' that follows it.
+#
+# WebKit emits 'finished' as the terminal event of every download including one
+# it just cancelled, so _finish runs a second time. Its once-only guard is what
+# keeps that second run from overwriting {path}/{err} -- and a caller that
+# registers on_finish LATE reads exactly those, so without the guard it is told
+# the download succeeded to a destination that was never set. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    my $kept;
+    $b->on_download(sub { $kept = $_[0] });          # deliberately name no destination
+    $b->{view}->download_uri($URL);
+    # let BOTH the cancel and the trailing 'finished' land before asking
+    my $t = EV::timer(3, 0, sub { EV::break }); EV::run; undef $t;
+
+    my @got = ('never called');
+    $kept->on_finish(sub { @got = @_ }) if $kept;
+    my $t2 = EV::timer(1, 0, sub { EV::break }); EV::run; undef $t2;
+    $b->quit;
+
+    ok($kept, 'the destination-less download reached on_download');
+    like($got[1] // '', qr/no destination/,
+         'a late on_finish still reports the cancel, not the finished that followed it');
+    is($got[0], undef, '...and reports no path');
 }
 
 # --- 3) on_download can choose the destination from the SUGGESTED name ---
@@ -106,6 +165,254 @@ my $URL = "http://127.0.0.1:$port/served.bin";
     $b->download($URL, File::Spec->catfile($dir, 'x.bin'), sub { $err = $_[1] });
     $b->quit;      # immediately, before the download can finish
     is($err, 'browser closed', 'quit() resolves an in-flight download callback');
+}
+
+# --- 4b) a uri WebKit canonicalises must still reach its own callback.
+#
+# download() parks the destination and callback for download-started to claim.
+# Keying that by the uri STRING looks obvious and is wrong: WebKit rewrites the
+# uri before reporting it, so a caller's spelling and WebKit's differ for
+# anything not already canonical. Every form below missed its parked entry, so
+# the destination was never applied, WebKit cancelled the download as
+# destination-less, and the callback was never called at all -- the download
+# just silently never happened. Keyed by the WebKitDownload's identity there is
+# no string to disagree about. ---
+{
+    my @forms = (
+        ["http://127.0.0.1:$port",               'no path (WebKit appends "/")'],
+        ["HTTP://127.0.0.1:$port/served.bin",    'uppercase scheme (lowercased)'],
+        ["http://127.0.0.1:$port/./served.bin",  'a dot segment (collapsed)'],
+        ["http://127.0.0.1:$port/served.bin?a=b c", 'a space in the query (percent-encoded)'],
+    );
+    my $n = 0;
+    for my $f (@forms) {
+        my ($uri, $why) = @$f;
+        my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+        my $dest = File::Spec->catfile($dir, 'canon-' . $n++ . '.bin');
+        my ($path, $err, $fired) = (undef, undef, 0);
+        $b->download($uri, $dest, sub { ($path, $err) = @_; $fired = 1; EV::break });
+        TWK::run_with_timeout(20);
+        $b->quit;
+        ok($fired, "download() calls back for a uri with $why")
+            or diag("uri=$uri -- never called back at all");
+        is($err, undef, "...with no error ($why)");
+        is($path, $dest, "...and the destination we asked for ($why)");
+    }
+}
+
+# --- 4bb) concurrent downloads stay distinct, including several of the SAME
+# uri. Identity keying gives each its own entry by construction; a uri-keyed
+# queue had to get the ordering right instead, and there is no ordering
+# guarantee between download_uri calls and the download-started signals. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 15);
+    my @want = (['/same', 'a.bin'], ['/same', 'b.bin'], ['/same', 'c.bin'],
+                ['/other', 'd.bin']);
+    my (%got, $left);
+    $left = @want;
+    for my $w (@want) {
+        my ($path, $name) = @$w;
+        my $dest = File::Spec->catfile($dir, "conc-$name");
+        $b->download("http://127.0.0.1:$port$path", $dest, sub {
+            $got{$name} = { path => $_[0], err => $_[1] };
+            EV::break unless --$left;
+        });
+    }
+    TWK::run_with_timeout(30);
+    $b->quit;
+
+    for my $w (@want) {
+        my ($path, $name) = @$w;
+        my $dest = File::Spec->catfile($dir, "conc-$name");
+        is(($got{$name} || {})->{err}, undef, "concurrent download $name: no error");
+        is(($got{$name} || {})->{path}, $dest, "...lands at its OWN destination");
+    }
+    # ...and each really is a separate file on disk, not one written four times
+    is(scalar(grep { -e File::Spec->catfile($dir, "conc-$_->[1]") } @want), 4,
+       'all four concurrent downloads produced their own file');
+}
+
+# --- 4c) a download still running when the browser closes reports 'browser
+# closed' to an on_finish registered AFTERWARDS, too. Teardown flushes the
+# callbacks it can see; one registered later used to route through the
+# dead-gated deferral and vanish without a trace -- and had it been delivered it
+# would have read (undef, undef), i.e. a successful download to nowhere. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    my $kept;
+    $b->on_download(sub { $kept = $_[0]; $_[0]->save_to(File::Spec->catfile($dir, 'slow.bin')) });
+    $b->{view}->download_uri("http://127.0.0.1:$port/slow");
+    my $t = EV::timer(5, 0, sub { EV::break });   # let the headers land and decide-destination fire
+    EV::run; undef $t;
+    ok($kept, 'the stalled download reached on_download') or diag('no download object');
+    $b->quit;                                     # close with it still in flight
+
+    my @got = ('never called');
+    $kept->on_finish(sub { @got = @_ }) if $kept;
+    my $t2 = EV::timer(1, 0, sub { EV::break }); EV::run; undef $t2;
+    is($got[1], 'browser closed', 'on_finish registered after quit() still reports browser closed');
+    is($got[0], undef,            '...and reports no path, rather than a phantom success');
+}
+
+# --- 4d) a COMPLETED download must be collectable.
+#
+# The three signal closures connected on the WebKitDownload each capture the
+# wrapper, and the wrapper holds the native as {dl}: a cycle refcounting cannot
+# break, so every finished download kept both alive for the life of the process
+# -- invisible in a short script and a steady leak in a long automation run.
+# _finish now disconnects them. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    my (@weak, $done);
+    $b->on_download(sub {
+        my ($d) = @_;
+        $d->save_to(File::Spec->catfile($dir, 'collect-' . scalar(@weak) . '.bin'));
+        my $w = $d; Scalar::Util::weaken($w); push @weak, \$w;
+        $d->on_finish(sub { EV::break if ++$done >= 3 });
+    });
+    $b->{view}->download_uri($URL) for 1 .. 3;
+    TWK::run_with_timeout(25);
+    # a couple of clean ticks, so any deferred release has run
+    for (1 .. 3) { my $t = EV::timer(0.05, 0, sub { EV::break }); EV::run }
+    # ANCHOR FIRST. @weak is filled only inside on_download, so without this the
+    # grep below runs over an empty list, returns 0, and passes -- meaning the
+    # test could not fail if the hook never fired at all. The leak direction is
+    # self-detecting (a live wrapper is defined); the hook-dead direction is not.
+    is(scalar @weak, 3, 'precondition: all three downloads reached on_download')
+        or diag('only ' . scalar(@weak) . ' wrapper(s) were ever observed');
+    is(scalar(grep { defined ${$_} } @weak), 0,
+       'a finished download wrapper is collectable (no signal-closure cycle)')
+        or diag('the wrapper and its WebKitDownload leak for the life of the process');
+    $b->quit;
+}
+
+# --- 4e) quit() landing between a download finishing and its deferred delivery.
+#
+# _finish drops the wrapper from {_downloads} immediately, and quit() cancels
+# every pending _defer timer -- so a quit() in that window found nothing owed in
+# either place and the callback simply vanished. The delivery is now tracked as
+# an op, like every other async call here, so teardown can still flush it. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    my @got = ('NEVER CALLED');
+    $b->on_download(sub {
+        my ($d) = @_;
+        $d->save_to(File::Spec->catfile($dir, 'race.bin'));
+        $d->on_finish(sub { @got = @_ });
+    });
+    # quit from a handler connected AFTER the module's own, so it runs in the
+    # same loop iteration as the finish that schedules the delivery
+    my $quit_done = 0;
+    $b->{session}->signal_connect('download-started' => sub {
+        $_[1]->signal_connect(finished => sub { $b->quit; $quit_done = 1 });
+    });
+    $b->{view}->download_uri($URL);
+    # break from a POLL timer, not from the signal handler: EV::break inside a
+    # GLib dispatch frame is the documented wedge, and this test must not be the
+    # thing that trips it
+    my $poll = EV::timer(0.05, 0.05, sub { EV::break if $quit_done });
+    my $wd   = EV::timer(15, 0, sub { EV::break });
+    EV::run; undef $poll; undef $wd;
+    is($got[1], 'browser closed', 'quit() racing a finished download still answers its callback')
+        or diag('got: ' . join(', ', map { $_ // 'undef' } @got));
+}
+
+# --- 4f) quit() from INSIDE on_download.
+#
+# decide-destination calls user code synchronously (WebKit needs the answer
+# before it writes anything), so it must carry the same in-dispatch guard as
+# every sibling handler: without it quit() tears the native window and view down
+# from inside the GLib dispatch frame -- the crash _release_natives_later exists
+# to avoid -- and an EV::break there wedges the next EV::run. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    my $entered = 0;
+    $b->on_download(sub {
+        my ($d) = @_;
+        $entered = 1;
+        $d->save_to(File::Spec->catfile($dir, 'quit-inside.bin'));
+        $b->quit;                       # the hazardous thing, from inside the frame
+        $entered = 2;                   # ...and we survived it
+    });
+    $b->{view}->download_uri($URL);
+    my $poll = EV::timer(0.05, 0.05, sub { EV::break if $entered == 2 });
+    my $wd   = EV::timer(15, 0, sub { EV::break });
+    EV::run; undef $poll; undef $wd;
+    # and the loop must still be usable afterwards -- a wedge shows up here
+    my $ticked = 0;
+    my $t = EV::timer(0.1, 0, sub { $ticked = 1; EV::break }); EV::run; undef $t;
+    ok($entered, 'on_download ran');
+    ok($ticked,  'quit() from inside on_download leaves the loop usable (no wedge, no crash)');
+}
+
+# --- 4g) save_to accepts a file:// URI, and decodes it properly.
+#
+# WebKitGTK 6.0 wants a plain path and stalls forever on a URI, so save_to
+# strips the prefix rather than passing that trap on. Stripping and stopping
+# there left the rest still URI-encoded: 'file:///tmp/a%20b' wrote a file
+# literally named 'a%20b', and 'file://localhost/x' became the RELATIVE path
+# 'localhost/x'. ---
+{
+    my $d = bless {}, 'EV::WebKit::Download';
+    my @ok = (
+        ['/tmp/plain',              '/tmp/plain',  'a plain path is untouched'],
+        ['file:///tmp/a%20b',       '/tmp/a b',    'percent escapes are decoded'],
+        ['file://localhost/tmp/x',  '/tmp/x',      'the localhost authority means this machine'],
+        # hostnames are case-insensitive, and the scheme is already stripped /i
+        ['file://LOCALHOST/tmp/x',  '/tmp/x',      'the localhost authority is case-insensitive'],
+        ['FILE://localhost/tmp/x',  '/tmp/x',      '...as is the scheme'],
+        ['file:///tmp/x',           '/tmp/x',      'an empty authority likewise'],
+    );
+    for my $c (@ok) {
+        $d->save_to($c->[0]);
+        is($d->{dest}, $c->[1], "save_to: $c->[2]");
+    }
+    eval { $d->save_to('file://otherhost/tmp/x') };
+    like($@, qr/not a local file/, 'save_to: a file:// URI naming another host croaks');
+    # %00 decodes to a NUL, which C reads as end-of-string on the other side of
+    # the GI call -- so this would have written /tmp/a and reported success for
+    # a path the caller never asked for
+    eval { $d->save_to('file:///tmp/a%00b') };
+    like($@, qr/NUL byte/, 'save_to: a percent-encoded NUL croaks rather than truncating the path');
+}
+
+# --- 4h) a destination save_to would reject must be rejected by download()
+# ITSELF, at the call site.
+#
+# Leaving it to the save_to call inside the download-started handler meant the
+# croak escaped into GLib's dispatch, which only warns. The rest of that handler
+# never ran: the callback -- already taken out of the parked registry and not yet
+# attached to the wrapper -- was reachable from nowhere, including quit; and
+# decide-destination was never connected, so WebKit chose the destination
+# itself, writing behind the caller's back. It also segfaulted. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    for my $bad ('file://somehost/tmp/f', 'file://localhost', 'file://', 'file:/tmp/x') {
+        eval { $b->download($URL, $bad, sub { }) };
+        like($@, qr/download: not a local file/,
+             "download() rejects '$bad' at the call site");
+    }
+    $b->quit;
+}
+
+# ...and the handler itself still answers the caller if a destination somehow
+# reaches it unapplied. Parked directly, since download() now refuses to create
+# this state -- the guard exists so that a throw there can never again strand a
+# callback or leave WebKit to pick the destination.
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    my ($fired, $err) = (0, undef);
+    my $dl = $b->{view}->download_uri($URL);
+    $b->{_dl_want}{ Scalar::Util::refaddr($dl) } = {
+        dest => 'file://somehost/tmp/f', dl => $dl,
+        cb   => sub { $fired = 1; $err = $_[1]; EV::break },
+    };
+    my $wd = EV::timer(15, 0, sub { EV::break });
+    EV::run; undef $wd;
+    $b->quit;
+    ok($fired, 'an unapplicable parked destination still answers the caller')
+        or diag('the callback was stranded');
+    like($err // '', qr/not a local file/, '...with the reason it failed');
 }
 
 # --- 5) validation ---
@@ -170,6 +477,49 @@ my $URL = "http://127.0.0.1:$port/served.bin";
     is($r->{name}, 'upload.txt', 'the page sees the file name we selected');
     # a real size proves the page can actually READ it, not just see a name
     is($r->{size}, 7, 'and its real size -- the file is genuinely readable by the page');
+}
+
+# --- 6b) an on_file_chooser that decides NOTHING leaves the page usable.
+#
+# The handler cancels an undecided request rather than leaving it outstanding.
+# Note honestly what this does NOT cover: whether the cancel happens is not
+# observable from the page on this engine -- measured, an unanswered request and
+# a cancelled one behave identically, including a second click still reaching the
+# handler. So the cancel stays as a defensive release of the native request, and
+# what is pinned here is the part that IS observable: the click completes and no
+# file is selected. ---
+{
+    my $b = EV::WebKit->new(window => [300, 200], timeout => 10);
+    my ($entered, $clicked) = (0, 0);
+    $b->on_file_chooser(sub { $entered = 1; return });    # neither select nor cancel
+    my $files = 'never-read';
+    $b->load_html('<input type=file id=f>', sub {
+        $b->find('#f', sub {
+            $_[0]->click(sub {
+                $clicked = 1;
+                $b->script('return String(document.getElementById("f").files.length)',
+                           sub { $files = $_[0]; EV::break });
+            });
+        });
+    });
+    TWK::run_with_timeout(20);
+    $b->quit;
+    ok($entered, 'on_file_chooser ran');
+    ok($clicked, '...the click completed rather than hanging on an unanswered chooser');
+    is($files, '0', '...and no file was selected');
+}
+
+# --- 6c) download() on an already-closed browser still answers its caller.
+# That path is only ever reached when the browser IS dead, so a dead-gated
+# deferral there would drop the callback every single time. ---
+{
+    my $b = EV::WebKit->new(window => [200, 150], timeout => 10);
+    $b->quit;
+    my @got = ('never called');
+    $b->download($URL, File::Spec->catfile($dir, 'after-quit.bin'), sub { @got = @_; EV::break });
+    my $t = EV::timer(3, 0, sub { EV::break }); EV::run; undef $t;
+    is($got[1], 'browser closed', 'download() after quit reports browser closed')
+        or diag('got: ' . join(', ', map { $_ // 'undef' } @got));
 }
 
 # --- 7) file-chooser validation ---

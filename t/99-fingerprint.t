@@ -429,6 +429,31 @@ like($@, qr/seed must be a non-negative integer/, 'non-integer seed croaks');
 eval { EV::WebKit->new(window => [200,150], seed => 5) };
 like($@, qr/seed requires fingerprint/, 'seed without fingerprint croaks');
 
+# The seed is reduced to 32 bits so the extension's cast to guint32 is defined,
+# and the reduction must give the SAME residue on every perl. Done with `%` on
+# the whole number it would not: `%` is exact only while the operand fits a UV,
+# so a seed above 2**53 -- exactly what a digest-derived seed is, the case the
+# reduction exists for -- numifies first on a perl without 64-bit integers and
+# lands on a different value than on a 64-bit one. Reducing digit by digit keeps
+# every intermediate under 2**33, which is exact everywhere.
+# Note honestly what these do and do not cover: on a perl WITH 64-bit integers
+# (this one) `%= 2**32` gives the same answers, so no assertion here can tell the
+# two implementations apart. They pin the intended values against the real
+# function -- not a copy of it -- so a 32-bit tester diverging shows up as a
+# failure there rather than as silently different noise.
+{
+    is(EV::WebKit::_reduce32('9007199254740993'), 1, 'a seed above 2**53 reduces exactly (2**53+1 -> 1)');
+    is(EV::WebKit::_reduce32('4294967296'), 0,       '2**32 reduces to 0');
+    is(EV::WebKit::_reduce32('4294967297'), 1,       '2**32+1 reduces to 1');
+    is(EV::WebKit::_reduce32('12345'), 12345,        'a small seed is unchanged');
+    # and the constructor really uses it: a huge seed must be accepted and
+    # reduced, not rejected or passed through
+    my $big = EV::WebKit->new(window => [200,150], fingerprint => 'windows-chrome',
+                              seed => '9007199254740993');
+    ok($big, 'a >2**53 seed is accepted by the constructor');
+    $big->quit;
+}
+
 # --- webgl capability data (pure Perl) ---
 for my $name (EV::WebKit::Fingerprint::profiles()) {
     my $p = EV::WebKit::Fingerprint::resolve($name);

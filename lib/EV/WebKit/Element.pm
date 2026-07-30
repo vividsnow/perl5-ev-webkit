@@ -161,10 +161,15 @@ sub submit {
 # off-screen element works in the DOM but a page that reacts to scroll position
 # (lazy images, sticky headers, infinite scroll) will not have done its work
 # yet, so a subsequent read sees the pre-scroll state.
+#
+# behavior:"instant" is load-bearing: under a page's own CSS
+# `scroll-behavior: smooth` the scroll ANIMATES, and this would resolve with the
+# viewport still travelling -- so the reads it exists to make correct happen at
+# the wrong offset.
 sub scroll_into_view {
     $_[0]->_call_js(
         'const el = window.__evwk.get(A.id, A.epoch);'
-      . 'el.scrollIntoView({block:"center", inline:"center"});'
+      . 'el.scrollIntoView({block:"center", inline:"center", behavior:"instant"});'
       . 'return true;',
         {}, $_[1]);
 }
@@ -178,7 +183,13 @@ sub hover {
     $_[0]->_call_js(
         'const el = window.__evwk.get(A.id, A.epoch);'
       . 'const r = el.getBoundingClientRect();'
+      # A PointerEvent built without these reports pointerType "" and isPrimary
+      # false, so a menu branching on the device takes the wrong branch -- which
+      # is the class of menu this method exists to open. MouseEventInit has no
+      # such members and WebIDL ignores unknown ones, so one dictionary serves
+      # both constructors.
       . 'const at = { bubbles:true, cancelable:true, view:window,'
+      . '             pointerType:"mouse", pointerId:1, isPrimary:true,'
       . '             clientX: r.left + r.width/2, clientY: r.top + r.height/2 };'
       . 'for (const t of ["pointerover","mouseover"]) {'
       . '  el.dispatchEvent(new (window.PointerEvent && t[0] === "p" ? PointerEvent : MouseEvent)(t, at)); }'
@@ -195,6 +206,10 @@ sub hover {
 sub select_option {
     my ($s, $value, $cb) = @_;
     _need_name(select_option => $value);   # same positional-binding trap as attr/prop
+    # Stringify before the JSON bridge: an option's value is always a string in
+    # the DOM and the match below is ===, so an integer crossed as a JSON number
+    # and select_option(5) failed to find <option value="5">.
+    $value = "$value";
     $s->_call_js(
         'const el = window.__evwk.get(A.id, A.epoch);'
       . 'if (!(el instanceof HTMLSelectElement)) throw new Error("element is not a <select>");'

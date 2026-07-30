@@ -65,4 +65,21 @@ $b->quit;
     ok(!defined $wb, 'setting a handler does not make the instance uncollectable');
 }
 
+# A handler passed to new() is validated there, not at fire time.
+#
+# The accessors croak on a non-CODE value, and on_request/on_response croak in
+# the constructor -- but the accessor-backed handlers skipped both when passed
+# to new(). The value was stored, and the only symptom came much later: the
+# dispatch eval turned "Not a CODE reference" into a warn and the handler
+# simply never ran.
+{
+    for my $h (qw(on_error on_load on_close on_navigate on_console
+                  on_dialog on_policy on_file_chooser on_download)) {
+        eval { EV::WebKit->new(window => [200,150], ephemeral => 1, $h => 'not-a-coderef') };
+        like($@, qr/\Q$h\E must be a code reference/, "new($h => string) croaks");
+    }
+    my $b = eval { EV::WebKit->new(window => [200,150], ephemeral => 1, on_close => sub { }) };
+    ok($b, '...and a real code reference is still accepted') and $b->quit;
+}
+
 done_testing;

@@ -216,4 +216,21 @@ $E->quit;
         or diag("err=" . ($ce // '') . " got " . scalar(@{ $list || [] }) . " cookies");
 }
 
+# cookie_jar is tested for DEFINEDNESS, not truth. '0' is a perfectly good
+# relative path and survives the empty-path croak, but it is Perl-false -- so
+# tested for truth it left the session ephemeral, and set_persistent_storage
+# silently bails on an ephemeral session. The caller asked for a persistent jar
+# and got silent non-persistence.
+{
+    my $dir = tempdir(CLEANUP => 1);
+    require Cwd;
+    my $cwd = Cwd::getcwd();
+    chdir $dir or die "chdir: $!";
+    my $b = EV::WebKit->new(window => [200,150], cookie_jar => '0');
+    ok(!$b->{session}->is_ephemeral, "cookie_jar => '0' still forces a persistent session")
+        or diag('a falsy-but-valid path was treated as no jar at all');
+    $b->quit;
+    chdir $cwd or die "chdir back: $!";
+}
+
 done_testing;

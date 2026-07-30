@@ -19,7 +19,12 @@ sub _so_dir {
     # under service managers and stale after any chdir).
     my $cwd = eval { Cwd::getcwd() };
     if (defined $cwd) {
-        push @cand, "$cwd/blib/lib/auto/share/dist/EV-WebKit/wext", "$cwd/share/wext";
+        # share/wext BEFORE blib: the Makefile rule compiles into share/wext and
+        # blib's is a COPY made afterwards, so preferring the copy left a
+        # checkout that already had a blib silently running the OLD extension
+        # whenever only the .so was rebuilt. Both in-tree paths still precede
+        # File::ShareDir, so a checkout still never resolves an installed .so.
+        push @cand, "$cwd/share/wext", "$cwd/blib/lib/auto/share/dist/EV-WebKit/wext";
     }
     my $dist = eval { File::ShareDir::dist_dir('EV-WebKit') };
     push @cand, "$dist/wext" if defined $dist;

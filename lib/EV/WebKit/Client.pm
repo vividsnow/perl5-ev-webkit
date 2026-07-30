@@ -5,7 +5,7 @@ use warnings;
 
 use Carp ();
 use Errno ();
-use IO::Socket::UNIX;
+use IO::Socket::UNIX ();   # () like every other import here: its Socket re-exports would otherwise land in this package as callable methods
 use MIME::Base64 ();
 use EV::WebKit::Protocol;
 use EV::WebKit::Client::Element;
@@ -33,8 +33,9 @@ our $VERSION = '0.04';
 # quietly clobber them.
 my @METHODS = qw(
     go load_html back forward reload stop
-    can_go_back can_go_forward uri title is_loading html
+    can_go_back can_go_forward uri title is_loading html status
     script script_async pdf
+    press scroll download wait_for_js
     settings set_user_agent user_agent set_proxy show_devtools
     set_cookie cookies clear_cookies save_cookies load_cookies
     quit

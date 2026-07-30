@@ -47,6 +47,33 @@ print "TAG ", \$el->tag, "\\n";
 my \$all = \$c->find_all('p');
 print "FINDALL ", scalar(\@\$all), "\\n";
 print "URI ", \$c->uri, "\\n";
+# The 0.04 surface. Client's POD promises "Every method of EV::WebKit is here,
+# with the same name and the same arguments" -- and none of these eleven were,
+# so the promise shipped false and the whole feature set was unreachable from
+# the mirror layer.
+print "STATUS ", (\$c->status // 'undef'), "\\n";
+print "PRESS ", (\$c->press('Enter') ? 'ok' : 'false'), "\\n";
+print "SCROLL ", (ref \$c->scroll(y => 10) eq 'HASH' ? 'hash' : 'not-hash'), "\\n";
+print "WAITJS ", \$c->wait_for_js('1 + 1'), "\\n";
+print "BOX ", (ref \$el->box eq 'HASH' ? 'hash' : 'not-hash'), "\\n";
+print "SIV ", (\$el->scroll_into_view ? 'ok' : 'false'), "\\n";
+print "HOVER ", (\$el->hover ? 'ok' : 'false'), "\\n";
+# send_keys is a glob alias of type, and the only alias in the distribution --
+# which is why it was missing from the mirror since Control was written:
+# enumerating the methods someone wrote out by hand does not turn up a symbol
+# created by *x = \\&y.
+# The page has nothing editable, so what is asserted is that the call REACHES
+# the real method -- "element is not editable" comes from Element::type itself,
+# whereas the gap produced "unknown method: el.send_keys" from the server.
+my \$sk = eval { \$c->find('#lnk')->send_keys('x'); 'reached' }
+        || (\$@ =~ /unknown method/ ? 'UNKNOWN-METHOD' : 'reached');
+print "SENDKEYS \$sk\\n";
+# Too MANY arguments must error, not hang. These methods bind positionally, so a
+# spare argument lands in the callback slot: most then croak, but uncheck's
+# my (\$s, \$cb) = \@_ takes it silently, passes undef down, and nothing ever
+# answers -- the client blocks until the socket closes.
+my \$over = eval { \$el->hover('extra'); 1 } ? 'no' : 'yes';
+print "ARITY \$over\\n";
 # an error CROAKS in blocking mode: synchronous code has no callback to hand it to
 my \$ok = eval { \$c->go(undef); 1 };
 print "CROAK ", (\$ok ? 'no' : 'yes'), " ", (\$@ =~ /uri required/ ? 'right-error' : "wrong: \$@"), "\\n";
@@ -88,6 +115,20 @@ CHILD
     like($out, qr/^FIND hi$/m,     'find() returns an element proxy, and its text reads');
     like($out, qr/^TAG h1$/m,      '...and its other methods work');
     like($out, qr/^FINDALL 2$/m,   'find_all() returns a proxy per match');
+    # --- the 0.04 surface, reachable over the socket at last ---
+    # WebKit synthesises a response for a custom-scheme load, and it carries a
+    # 200 -- so this pins the value crossing the socket, not just the plumbing
+    like($out, qr/^STATUS 200$/m,   'status() is mirrored');
+    like($out, qr/^PRESS ok$/m,     'press() is mirrored');
+    like($out, qr/^SCROLL hash$/m,  'scroll() is mirrored and its named cb option is handled');
+    like($out, qr/^WAITJS 2$/m,     'wait_for_js() is mirrored and returns the value');
+    like($out, qr/^BOX hash$/m,     'Element->box is mirrored');
+    like($out, qr/^SIV ok$/m,       'Element->scroll_into_view is mirrored');
+    like($out, qr/^HOVER ok$/m,     'Element->hover is mirrored');
+    like($out, qr/^SENDKEYS reached$/m,
+         'Element->send_keys is mirrored (the dist\'s only glob alias, missing since Control was written)');
+    like($out, qr/^ARITY yes$/m,
+         'too many arguments to an element method errors rather than hanging the client');
     like($out, qr/^URI cl:\/\/first$/m, 'uri() reflects where the client sent the browser');
     like($out, qr/^CROAK yes right-error$/m,
         'an error croaks in blocking mode, with the browser\'s own error string')

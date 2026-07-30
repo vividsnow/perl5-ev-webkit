@@ -16,6 +16,18 @@ eval { EV::WebKit->new(window => [400,300], fingerprint => 'windows-chrome',
                        network_fingerprint => 1, proxy => 'http://x:1') };
 like($@, qr/network_fingerprint/, 'croaks when combined with an explicit proxy');
 
+# the promised value check actually rejects. Rejecting only references let
+# every other number through: 2 was silently treated as 1 (feature on, target
+# derived), and 0.5 -- which contains a non-digit, so it read as an explicit
+# target name -- was handed to Proxy::Impersonate as the target '0.5', surfacing
+# as a confusing error from a layer further down. A real curl target has letters.
+for my $bad (2, 42, 0.5, '007') {
+    eval { EV::WebKit->new(window => [400,300], fingerprint => 'windows-chrome',
+                           network_fingerprint => $bad) };
+    like($@, qr/must be 1 or a curl-target string/,
+         "network_fingerprint => $bad is rejected, not silently reinterpreted");
+}
+
 # enabled: derives the target, spins an in-process proxy, reports the port
 my $b = EV::WebKit->new(window => [400,300],
     fingerprint => 'windows-chrome', network_fingerprint => 1);
