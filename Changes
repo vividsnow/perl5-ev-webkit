@@ -1,6 +1,7 @@
 Revision history for EV-WebKit
 
 0.04  (unreleased)
+        - packaging: META now carries a provides block, generated from lib/ by Module::Metadata rather than hand-listed. Five of the twelve packages are declared inside WebKit.pm (Dialog, Download, FileChooser, Policy, UserContent), which is what a hand-written list forgets.
         - fix: go()'s callback no longer hands back a stale title. It waited a fixed 10ms after load-changed:finished for the title to cross from the web process -- a guess about propagation that a loaded machine beats. It settles on notify::title now, falling back to a deadline only for a page with no <title>, which never sends one. Measured 0.19ms where the fixed wait took 10.
         - fix: the chrome's window caption tracks notify::title too, instead of re-refreshing on a timer sized to guess the same delay. That timer shared NAV_SETTLE_DELAY with the navigation settle, so raising the deadline left the window showing the previous page's title until it caught up.
         - doc: EV::WebKit::Client and its Element list their methods in prose (both generate almost all of them from a table), and both lists had drifted -- Client's missing status/press/scroll/download/wait_for_js, Element's box/check/uncheck/hover/select_option/send_keys/scroll_into_view. t/90-pod.t now checks each list against the symbol table.

@@ -28,6 +28,16 @@ WriteMakefile(
     META_MERGE       => {
         'meta-spec' => { version => 2 },
         resources   => { repository => { type=>'git', url=>'https://github.com/vividsnow/perl5-ev-webkit.git', web=>'https://github.com/vividsnow/perl5-ev-webkit' } },
+        # Generated from lib/ rather than hand-listed, so it cannot go stale as
+        # packages are added -- and five of the twelve are declared INSIDE
+        # WebKit.pm (Dialog, Download, FileChooser, Policy, UserContent), which
+        # is exactly what a hand-written list forgets. Soft-guarded rather than
+        # a CONFIGURE_REQUIRES: Module::Metadata is core since 5.14 but this
+        # dist still declares 5.010, and provides is author-side metadata that
+        # only has to be right in the tarball that gets uploaded.
+        (eval { require Module::Metadata; 1 }
+            ? (provides => Module::Metadata->provides(version => 2, dir => 'lib'))
+            : ()),
     },
 );
 
