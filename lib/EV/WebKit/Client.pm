@@ -423,10 +423,12 @@ rather than dropped. A dropped callback is a hung caller.
 =head1 METHODS
 
 C<connect>, C<hello> (the greeting frame: where the browser already was when you
-attached), C<events>, C<disconnect>, plus every C<EV::WebKit> method:
+attached), C<events>, C<path> (the socket this client is attached to),
+C<disconnect>, plus every C<EV::WebKit> method:
 C<go>, C<load_html>, C<back>, C<forward>, C<reload>, C<stop>, C<can_go_back>,
-C<can_go_forward>, C<uri>, C<title>, C<is_loading>, C<html>, C<script>,
-C<script_async>, C<find>, C<find_all>, C<wait_for>, C<screenshot>, C<pdf>,
+C<can_go_forward>, C<uri>, C<title>, C<is_loading>, C<status>, C<html>,
+C<script>, C<script_async>, C<find>, C<find_all>, C<wait_for>, C<wait_for_js>,
+C<press>, C<scroll>, C<screenshot>, C<pdf>, C<download>,
 C<settings>, C<set_user_agent>, C<user_agent>, C<set_proxy>, C<show_devtools>,
 C<set_cookie>, C<cookies>, C<clear_cookies>, C<save_cookies>, C<load_cookies>,
 C<quit>.

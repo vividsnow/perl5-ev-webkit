@@ -3,6 +3,9 @@
 /Makefile.old
 /pm_to_blib
 /MYMETA.*
+/META.yml
+/META.json
+/EV-WebKit-*.tar.gz
 *.bak
 /share/
 *.so

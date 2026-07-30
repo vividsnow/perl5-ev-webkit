@@ -2,6 +2,7 @@ use v5.10; use strict; use warnings;
 use Test::More;
 use lib 't/lib'; use TWK; TWK::skip_unless_available();
 use EV; use EV::WebKit;
+use IO::Socket::INET;
 
 # Regression coverage for "a stray navigation signal resolves the WRONG
 # nav's callback": {pending} used to be a bare [cb, timer] with no identity,
@@ -53,54 +54,105 @@ use EV; use EV::WebKit;
     $b->quit;
 }
 
-# --- 2) plain overlapping go()/go() a short delay apart -- the ~20%-flaky
-#     (live-probed) case: go(A) is issued, then go(B) fires from a short
-#     EV::timer before A settles. WebKit's cancellation of A's now-abandoned
-#     load can arrive as a load-failed for A's uri AFTER {pending} already
-#     holds B. Concentrated at the delay that reproduced it live (1ms,
-#     ~52% hit rate pre-fix over many repeats) -- post-fix this is a
-#     structural fix (not a timing mitigation), so every repeat must land
-#     cleanly, deterministically.
+# --- 2) plain overlapping go()/go() -- the non-reentrant case (1) and (3)
+#     cannot cover: an ordinary caller issuing a second go() while the first
+#     is still loading. WebKit's cancellation of A's now-abandoned load
+#     surfaces later as a load-failed for A's uri, by which time {pending}
+#     already holds B.
+#
+#     The overlap is MANUFACTURED, not raced. Issuing go(B) from a short
+#     EV::timer only tests anything when the timer beats the load, and stops
+#     doing so as navigation gets faster -- silently, since the outcome is
+#     asserted but never the premise. A server that withholds its response
+#     makes A provably in flight on any machine, and the preconditions below
+#     say so out loud instead of leaving it inferred from a passing result.
+#
+#     Two positions in A's lifecycle, since where the cancellation lands
+#     relative to the commit is exactly what the gates disambiguate:
+#       held  -- no response at all, so A is cancelled before committing
+#       hdrs  -- headers sent, body withheld, so A is cancelled after it
+#                commits and has a uri of its own
 {
-    my @stray_errors;
-    my $b = EV::WebKit->new(window=>[300,200], timeout=>5,
-        on_error => sub { push @stray_errors, $_[0] });
-    $b->mock_scheme('mock', sub {
-        my ($uri) = @_;
-        my ($n) = $uri =~ m{mock://(\w+)};
-        return ("<html><head><title>$n</title></head><body>$n</body></html>", 'text/html');
+    my $srv = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
+                                    Listen => 20, ReuseAddr => 1)
+        or plan skip_all => "cannot bind a test server socket: $!";
+    my $port = $srv->sockport;
+    my (%conns, @held);
+    my $accept = EV::io($srv, EV::READ, sub {
+        my $c = $srv->accept or return;
+        $c->blocking(0);
+        my $buf = '';
+        my $rw; $rw = EV::io($c, EV::READ, sub {
+            my $n = sysread($c, my $chunk, 4096);
+            if (!defined $n) { return if $!{EAGAIN} || $!{EWOULDBLOCK}; delete $conns{$c}; return }
+            return delete $conns{$c} unless $n;
+            $buf .= $chunk;
+            return unless $buf =~ /\r?\n\r?\n/;
+            delete $conns{$c};
+            my ($path) = $buf =~ m{^\S+\s+(\S+)};
+            $path //= '/';
+            # /held: never answer. /hdrs: headers only, body withheld. Both
+            # keep the socket open, so the load stays in flight until WebKit
+            # itself cancels it. @held holds the sockets -- dropping one here
+            # would close it and end the load we are trying to suspend.
+            if ($path =~ m{^/(held|hdrs)}) {
+                if ($1 eq 'hdrs') {
+                    $c->blocking(1);
+                    print $c "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                           . "Content-Length: 100000\r\n\r\n"
+                           . '<html><head><title>one</title></head><body>' . ('x' x 2000);
+                    $c->flush;
+                }
+                push @held, $c;
+                return;
+            }
+            my $body = '<html><head><title>two</title></head><body>two</body></html>';
+            print $c "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                   . "Content-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+            close $c;
+        });
+        $conns{$c} = $rw;
     });
 
-    my $REPEATS = 15;
-    for my $trial (1 .. $REPEATS) {
-        my $delay = 0.001;
-        my ($one_err, $two_ok, $two_err, $two_uri);
-        $b->go('mock://one', sub { (undef, $one_err) = @_ });
-        my $t2; $t2 = EV::timer($delay, 0, sub {
-            undef $t2;
-            $b->go('mock://two', sub {
-                ($two_ok, $two_err) = @_;
-                $two_uri = $b->uri;
-                EV::break;
-            });
-        });
-        my $wd = EV::timer($delay + 2, 0, sub {
-            fail("trial $trial: watchdog fired -- cb2 (go(two)) never resolved");
-            EV::break;
-        });
-        EV::run;
-        undef $wd;
+    for my $mode (qw(held hdrs)) {
+        for my $trial (1 .. 3) {
+            my @stray_errors;
+            my $b = EV::WebKit->new(window => [300,200], timeout => 5,
+                on_error => sub { push @stray_errors, $_[0] });
+            my $one = "http://127.0.0.1:$port/$mode";
+            my $two = "http://127.0.0.1:$port/two";
+            my ($one_err, $two_ok, $two_err, $two_uri);
+            $b->go($one, sub { (undef, $one_err) = @_ });
 
-        ok(defined $two_ok, "trial $trial: cb2 (go(two)) fired");
-        is($two_err, undef, "trial $trial: cb2 resolves without error")
-            or diag("two_err=" . ($two_err // 'u'));
-        is($two_uri, 'mock://two', "trial $trial: final uri is mock://two");
-        is($one_err, 'superseded', "trial $trial: cb1 (go(one)) superseded");
+            # Pump until A has provably started -- {pending}[4] is the module's
+            # own started_seen flag. Bounded, so a nav that never starts fails
+            # HERE rather than making the assertions below meaningless.
+            my $deadline = EV::time + 10;
+            until ((($b->{pending} || [])->[4]) || EV::time > $deadline) {
+                my $t = EV::timer(0.02, 0, sub { EV::break }); EV::run;
+            }
+            ok($b->{pending}, "$mode/$trial: precondition -- A is still in flight when B is issued")
+                or diag('A had already resolved; this trial would prove nothing');
+            ok(($b->{pending} || [])->[4], "$mode/$trial: precondition -- A has started");
+
+            $b->go($two, sub { ($two_ok, $two_err) = @_; $two_uri = $b->uri; EV::break });
+            my $wd = EV::timer(15, 0, sub {
+                fail("$mode/$trial: watchdog -- cb2 never resolved"); EV::break });
+            EV::run; undef $wd;
+
+            ok(defined $two_ok, "$mode/$trial: cb2 (go B) fired");
+            is($two_err, undef, "$mode/$trial: cb2 resolves without error")
+                or diag("two_err=" . ($two_err // 'undef'));
+            is($two_uri, $two, "$mode/$trial: final uri is B");
+            is($one_err, 'superseded', "$mode/$trial: cb1 (go A) superseded")
+                or diag("one_err=" . ($one_err // 'undef'));
+            is(scalar(@stray_errors), 0, "$mode/$trial: no stray on_error deliveries")
+                or diag("stray_errors=@stray_errors");
+            $b->quit;
+        }
     }
-    is(scalar(@stray_errors), 0, 'overlap-with-delay: no stray on_error deliveries')
-        or diag("stray_errors=@stray_errors");
-
-    $b->quit;
+    undef $accept;
+    close $_ for @held;
 }
 
 # --- 3) reentrant back() -- the same cross-talk mechanism as (1)/(2) above,

@@ -54,8 +54,10 @@ EV::WebKit::Client::Element - a remote element handle
 
 What L<EV::WebKit::Client>'s C<find> and C<find_all> give you. It has the same
 methods as L<EV::WebKit::Element> -- C<text>, C<html>, C<value>, C<tag>, C<attr>,
-C<prop>, C<is_visible>, C<click>, C<focus>, C<type>, C<clear>, C<submit>,
-C<find>, C<find_all> -- and each one is a request to the browser process.
+C<prop>, C<box>, C<is_visible>, C<click>, C<focus>, C<hover>, C<type>,
+C<send_keys>, C<clear>, C<check>, C<uncheck>, C<select_option>,
+C<scroll_into_view>, C<submit>, C<find>, C<find_all> -- and each one is a
+request to the browser process. C<handle> is the id the browser knows it by.
 
     my $el = $c->find('h1');
     say $el->text;

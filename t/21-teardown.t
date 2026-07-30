@@ -68,7 +68,11 @@ use EV; use EV::WebKit;
     $b->_finish_nav(undef);
     $b->{pending} = [ sub { $n2++ }, undef ];
     $b->_finish_nav(undef);
-    my $t1 = EV::timer(0.1, 0, sub { EV::break });
+    # Derive the wait from the settle deadline: these navs are driven straight
+    # through _finish_nav with no view behind them, so no notify::title can
+    # arrive and the deadline is their only arm. A hardcoded wait silently
+    # becomes too short the moment that constant is raised.
+    my $t1 = EV::timer(EV::WebKit::NAV_SETTLE_DELAY() + 0.05, 0, sub { EV::break });
     EV::run;
     is($n1, 1, 'first nav settle callback fired despite overlapping second');
     is($n2, 1, 'second nav settle callback fired');

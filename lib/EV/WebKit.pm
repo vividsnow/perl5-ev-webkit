@@ -10,13 +10,11 @@ use File::Path ();
 use Scalar::Util qw(weaken refaddr);
 use Carp ();   # Carp::croak -- core, no prereq change
 
-use constant NAV_SETTLE_DELAY => 0.01;   # WebKitGTK is multi-process: let web-process props (title/uri) propagate past load-changed:finished
+use constant NAV_SETTLE_DELAY => 0.15;   # deadline for the settle race in _finish_nav -- only a page with NO <title> ever waits it out
 
-# id-keyed registry counter for settle timers ({_settle} in _finish_nav and
-# {chrome}{settle} in _update_chrome), same idea as $_defer_seq below -- but
-# declared here (rather than beside $_defer_seq, textually below both of
-# those subs) since both subs reference it directly (not via a method call),
-# so it must be lexically in scope before their first use.
+# id-keyed registry counter for _finish_nav's settle slots ({_settle}), same
+# idea as $_defer_seq below -- declared up here because _finish_nav references
+# it directly, so it must be in scope before its first use.
 my $_settle_seq = 0;
 
 # generation counter for {pending} (the in-flight nav slot): every
@@ -1111,6 +1109,13 @@ sub _build_chrome {
         my $self = $wself or return;
         $self->_refresh_chrome unless $self->{_dead};
     });
+    # ...and the same for the title (the window caption), which likewise does not
+    # exist yet at load-changed:finished -- it arrives from the web process
+    # shortly after, and this is what says exactly when.
+    $self->{view}->signal_connect('notify::title' => sub {
+        my $self = $wself or return;
+        $self->_refresh_chrome unless $self->{_dead};
+    });
     return;
 }
 
@@ -1131,18 +1136,8 @@ sub _update_chrome {
     elsif ($ev eq 'finished') {
         $c->{loading} = 0;
         $c->{reload}->set_icon_name('view-refresh-symbolic');
-        # title/uri propagate from the web process shortly after 'finished'
-        # (the NAV_SETTLE_DELAY race) -- refresh once more after that window.
-        # id-keyed (like _finish_nav's {_settle}) so two 'finished' events
-        # within NAV_SETTLE_DELAY of each other don't GC each other's
-        # still-pending refresh timer via a single-slot overwrite.
-        my $id = ++$_settle_seq;
-        weaken(my $wself = $self);   # weak: same self-stored-timer cycle -- keep a bare drop during the settle window collectible
-        $c->{settle}{$id} = EV::timer(NAV_SETTLE_DELAY, 0, sub {
-            my $self = $wself or return;
-            delete $self->{chrome}{settle}{$id} if $self->{chrome};
-            $self->_refresh_chrome;
-        });
+        # No re-refresh timer for the late-arriving title here: notify::title
+        # (connected in _build_chrome) delivers it exactly when it lands.
     }
     $self->_refresh_chrome;
 }
@@ -1517,16 +1512,28 @@ sub _finish_nav {
         elsif ($self->{on_error} && $err ne 'superseded') { $self->_defer_final($self->{on_error}, $err) }   # _defer_final: see above
     }
     else {
-        # defer so web-process props (title/uri) reach the UI process; keep the
-        # timer reachable on $self (id-keyed, like _defer, so a second nav that
-        # settles within NAV_SETTLE_DELAY of this one doesn't GC this still-
-        # pending timer out from under it via a single-slot overwrite) so
-        # quit() can cancel it, and guard on _dead.
+        # Wait for the web-process props to reach the UI process, so the caller
+        # is not handed a browser whose title() is still undef. The uri is
+        # already set by 'started', so the title is the only prop that lags --
+        # and this is a race between the two things that can resolve it:
+        #
+        #   notify::title -- the page HAS a title. Lands ~0.1ms after 'finished'.
+        #   the deadline  -- the page has NO <title>, so no notification is ever
+        #                    coming and only a timeout can resolve it.
+        #
+        # Both arms are kept on $self (id-keyed, like _defer, so a second nav
+        # settling inside this window cannot GC this one's timer via a
+        # single-slot overwrite) so quit() can cancel and disconnect them.
         my $id = ++$_settle_seq;
         weaken(my $wself = $self);   # weak: same self-stored-timer cycle as the pending timer -- keep a bare drop during the brief settle window collectible
-        $self->{_settle}{$id} = EV::timer(NAV_SETTLE_DELAY, 0, sub {
+        my $settled = 0;             # whichever arm arrives first wins
+        my $finish_settle = sub {
             my $self = $wself or return;
+            return if $settled++;
             delete $self->{_settle}{$id};
+            if (my $h = delete $self->{_settle_sig}{$id}) {
+                eval { $self->{view}->signal_handler_disconnect($h) } if $self->{view};
+            }
             return if $self->{_dead};
             # A throwing per-call callback must not rob on_load of its turn
             # (POD promises on_load fires for every successful instance-initiated
@@ -1544,7 +1551,18 @@ sub _finish_nav {
                 }
             }
             die $cberr if defined $cberr;
-        });
+        };
+        $self->{_settle}{$id} = EV::timer(NAV_SETTLE_DELAY, 0, $finish_settle);
+        # Re-arm at zero rather than settling here: the notification arrives
+        # inside GLib's dispatch, and running the caller's callback (and its
+        # possible EV::break) in that frame is the wedge $IN_DISPATCH exists for.
+        if ($self->{view}) {
+            $self->{_settle_sig}{$id} = $self->{view}->signal_connect('notify::title' => sub {
+                my $self = $wself or return;
+                return if $settled || !exists $self->{_settle}{$id};
+                $self->{_settle}{$id} = EV::timer(0, 0, $finish_settle);
+            });
+        }
     }
 }
 
@@ -2831,7 +2849,12 @@ sub quit {
     $self->{_defer} = {};
     $_->stop for values %{ $self->{_settle} || {} };
     $self->{_settle} = {};
-    if (my $c = $self->{chrome}) { $_->stop for values %{ $c->{settle} || {} }; $c->{settle} = {} }
+    # ...and the notify::title handlers racing those timers, which would
+    # otherwise stay subscribed to a view we are about to destroy.
+    if (my $v = $self->{view}) {
+        eval { $v->signal_handler_disconnect($_) } for values %{ $self->{_settle_sig} || {} };
+    }
+    $self->{_settle_sig} = {};
     # Called from INSIDE a WebKit/GLib dispatch frame (on_dialog, on_policy,
     # on_console, a mock_scheme producer)? Then finish on a clean EV tick
     # instead of here. _teardown resolves other ops' callbacks, and those are
@@ -3671,10 +3694,13 @@ Load pages and read basic document state.
 Loads C<$uri>. On success C<$result> is true; on failure (or timeout)
 C<$err> is set. If a previous navigation on this instance was still
 in-flight, its callback is immediately invoked with C<$err eq
-'superseded'>. The callback fires shortly (~10ms) after WebKit's own
-C<load-changed:finished> signal, to give the web process time to propagate
-C<title>/C<uri> to the UI process; C<on_load> (if configured) fires right
-after it. Returns C<$b> (chainable).
+'superseded'>. The callback fires just after WebKit's own
+C<load-changed:finished> signal -- once the document C<title> has crossed
+from the web process, which it does a fraction of a millisecond later
+(C<uri> needs no such wait; it is set before C<finished>). A page with no
+C<< <title> >> never sends that notification, and settles on a 150ms
+deadline instead. C<on_load> (if configured) fires right after the
+callback. Returns C<$b> (chainable).
 
 =head3 load_html
 
