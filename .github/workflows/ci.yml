@@ -17,19 +17,35 @@ jobs:
 
       - name: cpan deps
         run: |
-          # The runner's perl tree is not writable, so cpanm falls back to
-          # ~/perl5 (a local::lib layout) -- and still exits 0. That directory is
-          # NOT in the default @INC, so every later `perl Makefile.PL` fails to
-          # find what we just "successfully installed". Put it on PERL5LIB for
-          # this step and, via $GITHUB_ENV, for the build and test steps too.
-          export PERL5LIB="$HOME/perl5/lib/perl5${PERL5LIB:+:$PERL5LIB}"
-          echo "PERL5LIB=$PERL5LIB" >> "$GITHUB_ENV"
+          # Installed with sudo, straight into the system perl, so everything
+          # lands in the default @INC and no later step needs PERL5LIB.
+          #
+          # cpanm's OTHER mode is what used to break: finding the perl tree
+          # unwritable, it bootstraps local::lib into ~/perl5 instead. On runner
+          # image 20260726.254 that bootstrap failed while building the very
+          # first module (File::ShareDir::Install, 'Configuring OK' then
+          # 'Building FAIL'), and because GitHub rolls new images out gradually,
+          # whether a given run hit it was luck -- measured 3/3 failures on
+          # 20260726.254 against 4/4 successes on 20260720.247, which is what
+          # made it look like a flake. Writing to a tree that IS writable never
+          # enters that path.
+          deps() { sudo cpanm --notest "$@"; }
+          # cpanm names a build.log that is not in the run artifacts, which is
+          # what made the original failure opaque. Print it before giving up.
+          logs() {
+            for f in /root/.cpanm/work/*/build.log "$HOME"/.cpanm/work/*/build.log; do
+              [ -f "$f" ] || continue
+              echo "::group::$f"; sudo tail -80 "$f"; echo "::endgroup::"
+            done
+          }
           # CONFIGURE_REQUIRES first: `cpanm --installdeps .` has to RUN
           # Makefile.PL to discover the deps, and Makefile.PL cannot even compile
           # without File::ShareDir::Install, so installdeps alone cannot bootstrap.
-          cpanm --notest File::ShareDir::Install File::ShareDir
-          cpanm --notest --installdeps . \
-            || cpanm --notest EV EV::Glib Glib Glib::Object::Introspection Glib::IO Cpanel::JSON::XS
+          deps File::ShareDir::Install File::ShareDir \
+            || { logs; deps File::ShareDir::Install File::ShareDir; }
+          deps --installdeps . \
+            || deps EV EV::Glib Glib Glib::Object::Introspection Glib::IO Cpanel::JSON::XS \
+            || { logs; exit 1; }
 
       - name: build
         run: |
