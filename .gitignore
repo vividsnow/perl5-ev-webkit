@@ -1,0 +1,26 @@
+/blib/
+/Makefile
+/Makefile.old
+/pm_to_blib
+/MYMETA.*
+/META.yml
+/META.json
+/EV-WebKit-*.tar.gz
+*.bak
+/share/
+*.so
+/.superpowers/
+.tmp/
+
+# Internal adversarial-review findings: kept locally, never published --
+# they enumerate live detection vectors against this module.
+/docs/
+
+# Debris from ref-as-path probes: a stringified reference used where a path
+# was expected. Harmless, but `git add -A` swept one into a commit once and CI
+# then failed on a test that checks none exists.
+/ARRAY(0x*)
+/HASH(0x*)
+/CODE(0x*)
+/SCALAR(0x*)
+/bytes

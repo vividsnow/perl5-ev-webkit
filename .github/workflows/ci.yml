@@ -1,0 +1,99 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  linux:
+    # `without` builds with the web-process extension deliberately unbuildable,
+    # which is the path a host with no C toolchain takes: Makefile.PL warns,
+    # skips install_share, and the module installs anyway with fingerprinting
+    # and frame addressing disabled. Nothing else exercises that branch, and it
+    # is the one install path a user cannot fix themselves.
+    name: linux (extension ${{ matrix.extension }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        extension: [with, without]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb cpanminus \
+            gir1.2-gtk-4.0 gir1.2-javascriptcoregtk-6.0 gir1.2-soup-3.0 \
+            libwebkitgtk-6.0-4 gir1.2-webkit-6.0 \
+            libgirepository1.0-dev
+
+      - name: cpan deps
+        run: |
+          # Installed with sudo, straight into the system perl, so everything
+          # lands in the default @INC and no later step needs PERL5LIB.
+          #
+          # cpanm's OTHER mode is what used to break: finding the perl tree
+          # unwritable, it bootstraps local::lib into ~/perl5 instead. On runner
+          # image 20260726.254 that bootstrap failed while building the very
+          # first module (File::ShareDir::Install, 'Configuring OK' then
+          # 'Building FAIL'), and because GitHub rolls new images out gradually,
+          # whether a given run hit it was luck -- measured 3/3 failures on
+          # 20260726.254 against 4/4 successes on 20260720.247, which is what
+          # made it look like a flake. Writing to a tree that IS writable never
+          # enters that path.
+          deps() { sudo cpanm --notest "$@"; }
+          # cpanm names a build.log that is not in the run artifacts, which is
+          # what made the original failure opaque. Print it before giving up.
+          logs() {
+            for f in /root/.cpanm/work/*/build.log "$HOME"/.cpanm/work/*/build.log; do
+              [ -f "$f" ] || continue
+              echo "::group::$f"; sudo tail -80 "$f"; echo "::endgroup::"
+            done
+          }
+          # CONFIGURE_REQUIRES first: `cpanm --installdeps .` has to RUN
+          # Makefile.PL to discover the deps, and Makefile.PL cannot even compile
+          # without File::ShareDir::Install, so installdeps alone cannot bootstrap.
+          deps File::ShareDir::Install File::ShareDir \
+            || { logs; deps File::ShareDir::Install File::ShareDir; }
+          deps --installdeps . \
+            || deps EV EV::Glib Glib Glib::Object::Introspection Glib::IO Cpanel::JSON::XS \
+            || { logs; exit 1; }
+
+      # Only from here on: cpanm's own builds (Glib, EV::Glib) need the real one.
+      - name: make the extension unbuildable
+        if: matrix.extension == 'without'
+        run: |
+          mkdir -p "$HOME/nopkg"
+          printf '#!/bin/sh\nexit 1\n' > "$HOME/nopkg/pkg-config"
+          chmod +x "$HOME/nopkg/pkg-config"
+          echo "$HOME/nopkg" >> "$GITHUB_PATH"
+
+      - name: build
+        run: |
+          perl Makefile.PL
+          make
+
+      - name: the extension is (not) there, as asked for
+        run: |
+          perl -Mblib -MEV::WebKit::Fingerprint -e '
+            my $want = $ARGV[0] eq "with" ? 1 : 0;
+            my $got  = EV::WebKit::Fingerprint::available();
+            die "extension available=$got, expected $want\n" if $got != $want;
+            print "extension available=$got as expected\n";
+          ' '${{ matrix.extension }}'
+
+      - name: sanity check (typelibs resolve without a display)
+        run: perl -Mblib -MEV::WebKit -e 'die "EV::WebKit not available\n" unless EV::WebKit::available'
+
+      # Quoted: an unquoted colon-space in a YAML scalar starts a mapping, which
+      # made this whole workflow unparseable and every run fail in 0s.
+      - name: "test (bring-your-own-display: must run under xvfb-run, plain make test would skip_all)"
+        # A GitHub runner denies the network-namespace setup WebKit's bubblewrap
+        # sandbox performs ("bwrap: loopback: Failed RTM_NEWADDR"), so the web
+        # process dies and every API call aborts on lost credentials -- 55 of 64
+        # test programs died with SIGABRT before this. There is no a11y bus
+        # either, and dmabuf/compositing has nothing to talk to under llvmpipe.
+        env:
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+          GTK_A11Y: none
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+        run: xvfb-run -a make test
