@@ -95,8 +95,11 @@ t/99-fingerprint.t
 t/A0-readback-noise.t
 t/A1-webgl-caps.t
 t/A2-features.t
+t/A3-worker-identity.t
+t/A4-fonts.t
 t/lib/TCTL.pm
 t/lib/TWK.pm
 wext/evwk_fp.c
 xt/66-nav-finished.t
+xt/fingerprint-audit.t
 xt/fingerprint-spike.pl

@@ -1188,6 +1188,95 @@ static const char *NAMEFIX_JS =
     "    try{ var C=window[n]; if(C && C.prototype) fix(C.prototype); }catch(e){} });"
     "})();";
 
+/* Worker and SharedWorker global scopes are separate JS contexts, and the web
+ * process extension API has no hook for them: window-object-cleared never fires
+ * for a worker, and the typelib exposes nothing worker-shaped. So the C spoof
+ * above cannot reach WorkerNavigator, and a worker reported the REAL platform
+ * and core count beside a spoofed page -- navigator.platform 'Win32' on the
+ * page and 'Linux x86_64' in its own worker is the clearest contradiction a
+ * detector can ask for, and measurably what the "inconsistent worker values"
+ * checks fire on.
+ *
+ * So the constructor runs the same overrides as a prelude and pulls the real
+ * script in after them. Through a Proxy rather than a JS function, because
+ * Function.prototype.toString on a Proxy still reports [native code] -- see
+ * NAMEFIX_JS on why an own toString costs more than the lie it hides. name,
+ * length, prototype and instanceof all come along for free.
+ *
+ * The values are read from the page at construction, not baked in here, so the
+ * worker cannot disagree with whatever the page is currently showing.
+ *
+ * Cost of the blob: self.location inside the worker is the blob URL, so a
+ * script that resolves its own chunks relatively would break. importScripts and
+ * fetch are re-based onto the original URL to cover that. A module worker
+ * cannot use importScripts, so it gets a dynamic import(), and messages that
+ * arrive before that promise settles are buffered and replayed -- without it a
+ * postMessage racing worker startup is simply lost. */
+static const char *WORKER_JS =
+    "(function(){"
+    "  var W=self.Worker, SW=self.SharedWorker;"
+    "  if(typeof W!=='function'||typeof Proxy!=='function') return;"
+    "  var cache=Object.create(null);"
+    "  function cfg(){"
+    "    var n=navigator,u=n.userAgentData;"
+    "    return { platform:n.platform, hardwareConcurrency:n.hardwareConcurrency,"
+    "             deviceMemory:n.deviceMemory, language:n.language,"
+    /* NavigatorID members: the spec puts them on WorkerNavigator too and both
+     * Chrome and Safari have them there, but WebKitGTK omits all three -- so
+     * they read as an inconsistency even with no profile applied. */
+    "             vendor:n.vendor, vendorSub:n.vendorSub, productSub:n.productSub,"
+    "             languages:n.languages?Array.prototype.slice.call(n.languages):null,"
+    "             ua:u?{brands:(u.brands||[]).map(function(b){return {brand:b.brand,version:b.version}}),"
+    "                   mobile:!!u.mobile, platform:u.platform}:null }; }"
+    "  function prelude(c,b){"
+    "    return '(function(c,b){'+"
+    "      'var np=self.WorkerNavigator?self.WorkerNavigator.prototype:Object.getPrototypeOf(navigator);'+"
+    "      'function d(k,v){if(v===undefined||v===null)return;try{Object.defineProperty(np,k,'+"
+    "        '{get:function(){return v},enumerable:true,configurable:true})}catch(e){}}'+"
+    "      'd(\"platform\",c.platform);d(\"hardwareConcurrency\",c.hardwareConcurrency);'+"
+    "      'd(\"deviceMemory\",c.deviceMemory);d(\"language\",c.language);'+"
+    "      'd(\"vendor\",c.vendor);d(\"vendorSub\",c.vendorSub);d(\"productSub\",c.productSub);'+"
+    "      'if(c.languages)d(\"languages\",Object.freeze(c.languages.slice()));'+"
+    "      'if(c.ua){try{var U=function NavigatorUAData(){};'+"
+    "        '[[\"brands\",function(){return c.ua.brands.slice()}],[\"mobile\",function(){return c.ua.mobile}],'+"
+    "         '[\"platform\",function(){return c.ua.platform}]].forEach(function(kv){'+"
+    "          'Object.defineProperty(U.prototype,kv[0],{get:kv[1],enumerable:true,configurable:true})});'+"
+    "        'd(\"userAgentData\",Object.create(U.prototype))}catch(e){}}'+"
+    "      'var oi=self.importScripts;'+"
+    "      'if(typeof oi===\"function\"){self.importScripts=function(){'+"
+    "        'return oi.apply(self,Array.prototype.map.call(arguments,function(u){'+"
+    "          'try{return new URL(u,b).href}catch(e){return u}}))}}'+"
+    "      'var of=self.fetch;'+"
+    "      'if(typeof of===\"function\"){self.fetch=function(i,o){'+"
+    "        'try{if(typeof i===\"string\")i=new URL(i,b).href}catch(e){}return of.call(self,i,o)}}'+"
+    "    '})('+JSON.stringify(c)+','+JSON.stringify(b)+');'; }"
+    "  function body(abs,mod){"
+    "    var p=prelude(cfg(),abs), u=JSON.stringify(abs);"
+    "    if(!mod) return p+'importScripts('+u+');';"
+    "    return p+'(function(){var q=[],done=false;'+"
+    "      'function cap(e){if(!done)q.push(e)}'+"
+    "      'self.addEventListener(\"message\",cap);'+"
+    "      'import('+u+').then(function(){done=true;self.removeEventListener(\"message\",cap);'+"
+    "        'q.forEach(function(e){self.dispatchEvent(new MessageEvent(\"message\",'+"
+    "          '{data:e.data,origin:e.origin,ports:e.ports}))});q.length=0})})();'; }"
+    "  function url_for(u,opts){"
+    "    var abs=new URL(u,self.location.href).href;"
+    "    var mod=!!(opts&&opts.type==='module');"
+    "    var key=(mod?'m:':'c:')+abs;"
+    /* one blob per script, so a SharedWorker keeps being shared: its identity is
+     * the URL, and a fresh blob each call would silently make N private workers */
+    "    return cache[key]||(cache[key]=URL.createObjectURL("
+    "      new Blob([body(abs,mod)],{type:'text/javascript'}))); }"
+    "  function wrap(B){"
+    "    return new Proxy(B,{ construct:function(t,a,nt){"
+    "      try{ if(typeof a[0]==='string'||a[0]instanceof URL)"
+    "             a=[url_for(String(a[0]),a[1])].concat(Array.prototype.slice.call(a,1)); }"
+    "      catch(e){}"
+    "      return Reflect.construct(t,a,nt); } }); }"
+    "  try{ self.Worker=wrap(W); }catch(e){}"
+    "  try{ if(typeof SW==='function') self.SharedWorker=wrap(SW); }catch(e){}"
+    "})();";
+
 /* The profile, parsed once from the GVariant and read by the getters. */
 typedef struct {
     char *platform, *vendor, *webgl_vendor, *webgl_renderer, *coherence;
@@ -1347,6 +1436,9 @@ static void on_window_object_cleared (WebKitScriptWorld *world, WebKitWebPage *p
         /* before NAMEFIX, like the others: it renames whatever accessors exist */
         JSCValue *p = jsc_context_evaluate (ctx, PLUGINS_JS, -1);
         if (p) g_object_unref (p);
+        /* reads the spoofed navigator lazily, so order against it does not matter */
+        JSCValue *w = jsc_context_evaluate (ctx, WORKER_JS, -1);
+        if (w) g_object_unref (w);
         /* after every accessor exists, including the native ones above */
         JSCValue *n = jsc_context_evaluate (ctx, NAMEFIX_JS, -1);
         if (n) g_object_unref (n);

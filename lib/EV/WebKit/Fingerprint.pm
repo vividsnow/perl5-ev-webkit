@@ -1,6 +1,6 @@
 package EV::WebKit::Fingerprint;
 use v5.10; use strict; use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 use File::ShareDir ();
 use Carp ();
 use Glib ();
