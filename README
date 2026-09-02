@@ -299,12 +299,27 @@ CONSTRUCTOR
         while the JS-property spoof is not -- an incoherent state the module
         cannot detect from the UI process. Coverage: "navigator" (platform,
         vendor, languages, hardwareConcurrency, deviceMemory,
-        maxTouchPoints), "screen", "devicePixelRatio", and the WebGL GPU
-        vendor/renderer strings. The navigator/screen getters are installed
-        natively, on the prototype and enumerable, so they read as the
-        engine's own to everything except "Function.prototype.toString" --
-        see the Ceiling below, which is where the remaining tells are
-        enumerated honestly.
+        maxTouchPoints, and for a Gecko profile productSub, oscpu and
+        buildID), "screen", "devicePixelRatio",
+        "window.mozInnerScreenX"/"Y", and the WebGL GPU vendor/renderer
+        strings. The navigator/screen getters are installed natively, on the
+        prototype and enumerable, so they read as the engine's own to
+        everything except "Function.prototype.toString" -- see the Ceiling
+        below, which is where the remaining tells are enumerated honestly.
+
+        "windows-firefox" asks more of this than the others. The engine
+        really is WebKit, so a Safari profile is a small lie and a Chrome
+        one a larger one, but claiming Gecko means supplying a surface no
+        WebKit build has: "productSub" (Gecko reports 20100101 where WebKit
+        and Chromium report 20030107), "oscpu" and "buildID", which exist in
+        no other engine and whose ABSENCE identifies the engine as surely as
+        a wrong value, and "window.mozInnerScreenX"/"Y". Those are supplied.
+        What is not, and cannot be without the engine, is CSS:
+        "CSS.supports('-moz-appearance', 'none')" is false here and true in
+        Firefox, and no property override fixes that without breaking the
+        styling it claims to support. Use "windows-firefox" for the
+        network-layer identity -- where it is exact -- and expect a
+        determined JS-layer engine probe to see through it.
 
         A coherence layer fills the gaps a bare navigator/screen spoof would
         leave: a Chrome profile also gets "window.chrome" and a working
@@ -513,9 +528,15 @@ CONSTRUCTOR
         the browser through it: the proxy terminates WebKit's TLS locally
         and re-originates each request as the matching real browser via
         "libcurl-impersonate". The curl target is derived from the profile
-        ("windows-chrome" -> "chrome131", "macos-safari" -> "safari18_0",
-        "iphone-safari" -> "safari18_0_ios", "pixel-chrome" ->
-        "chrome131_android"); pass a string to override it.
+        ("windows-chrome" -> "chrome150", "macos-safari" -> "safari26_0",
+        "iphone-safari" -> "safari26_0_ios", "windows-firefox" ->
+        "firefox147", "pixel-chrome" -> "chrome131_android"); pass a string
+        to override it.
+
+        "pixel-chrome" stays on Chrome 131 where the others track current
+        stable, because "chrome131_android" is the newest Android target
+        "libcurl-impersonate" ships and a profile must not claim a browser
+        its TLS cannot back.
 
         The profile's identity headers (User-Agent + "Sec-CH-UA") are forced
         over the curl target's defaults, so even a Windows profile is

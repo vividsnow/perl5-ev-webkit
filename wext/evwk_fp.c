@@ -1280,9 +1280,16 @@ static const char *WORKER_JS =
 /* The profile, parsed once from the GVariant and read by the getters. */
 typedef struct {
     char *platform, *vendor, *webgl_vendor, *webgl_renderer, *coherence;
+    /* Gecko-only navigator surface. NULL for every non-Firefox profile, and
+     * absent is the correct answer there -- Chrome and Safari expose neither
+     * oscpu nor buildID, and their productSub already IS WebKit's 20030107. */
+    char *product_sub, *oscpu, *build_id;
     char **languages;                                  /* NULL-terminated, or NULL */
     gboolean has_hwc, has_devmem, has_touch, has_dpr;
     double hwc, devmem, touch, dpr;
+    /* Gecko-only window properties; see product_sub above. */
+    gboolean has_misx, has_misy;
+    double misx, misy;
     gboolean has_sw, has_sh, has_aw, has_ah, has_cd, has_pd;
     double sw, sh, aw, ah, cd, pd;
     gboolean has_seed; guint32 seed;
@@ -1292,12 +1299,17 @@ static Profile P;
 /* strings return char* (JSC copies); numbers return gdouble by value. */
 static char *g_platform (void*a,void*b){(void)a;(void)b; return g_strdup(P.platform);}
 static char *g_vendor   (void*a,void*b){(void)a;(void)b; return g_strdup(P.vendor);}
+static char *g_prodsub  (void*a,void*b){(void)a;(void)b; return g_strdup(P.product_sub);}
+static char *g_oscpu    (void*a,void*b){(void)a;(void)b; return g_strdup(P.oscpu);}
+static char *g_buildid  (void*a,void*b){(void)a;(void)b; return g_strdup(P.build_id);}
 /* navigator.language (singular) must equal languages[0] or a real browser mismatch shows. */
 static char *g_language (void*a,void*b){(void)a;(void)b; return g_strdup(P.languages && P.languages[0] ? P.languages[0] : "");}
 static gdouble g_hwc    (void*a,void*b){(void)a;(void)b; return P.hwc;}
 static gdouble g_devmem (void*a,void*b){(void)a;(void)b; return P.devmem;}
 static gdouble g_touch  (void*a,void*b){(void)a;(void)b; return P.touch;}
 static gdouble g_dpr    (void*a,void*b){(void)a;(void)b; return P.dpr;}
+static gdouble g_misx   (void*a,void*b){(void)a;(void)b; return P.misx;}
+static gdouble g_misy   (void*a,void*b){(void)a;(void)b; return P.misy;}
 static gdouble g_sw(void*a,void*b){(void)a;(void)b; return P.sw;}
 static gdouble g_sh(void*a,void*b){(void)a;(void)b; return P.sh;}
 static gdouble g_aw(void*a,void*b){(void)a;(void)b; return P.aw;}
@@ -1368,6 +1380,9 @@ static void on_window_object_cleared (WebKitScriptWorld *world, WebKitWebPage *p
     if (navproto) {
         if (P.platform) def_str (navproto, "platform", G_CALLBACK (g_platform));
         if (P.vendor)   def_str (navproto, "vendor",   G_CALLBACK (g_vendor));
+        if (P.product_sub) def_str (navproto, "productSub", G_CALLBACK (g_prodsub));
+        if (P.oscpu)       def_str (navproto, "oscpu",      G_CALLBACK (g_oscpu));
+        if (P.build_id)    def_str (navproto, "buildID",    G_CALLBACK (g_buildid));
         if (P.has_hwc)    def_num (navproto, "hardwareConcurrency", G_CALLBACK (g_hwc));
         if (P.has_devmem) def_num (navproto, "deviceMemory",        G_CALLBACK (g_devmem));
         if (P.has_touch)  def_num (navproto, "maxTouchPoints",      G_CALLBACK (g_touch));
@@ -1392,6 +1407,10 @@ static void on_window_object_cleared (WebKitScriptWorld *world, WebKitWebPage *p
 
     /* devicePixelRatio is genuinely an own property of window. */
     if (P.has_dpr) def_num (global, "devicePixelRatio", G_CALLBACK (g_dpr));
+    /* A constant, where the real thing tracks the window: only a script that
+     * MOVES the window can tell, and being absent is the louder tell. */
+    if (P.has_misx) def_num (global, "mozInnerScreenX", G_CALLBACK (g_misx));
+    if (P.has_misy) def_num (global, "mozInnerScreenY", G_CALLBACK (g_misy));
 
     if (P.has_seed) {
         /* The format is a LITERAL and the JS body is a %s ARGUMENT, so no edit to
@@ -1689,6 +1708,9 @@ void webkit_web_process_extension_initialize_with_user_data (WebKitWebProcessExt
         if (g_variant_lookup (ud, "vendor",         "&s", &s) && s) P.vendor         = g_strdup (s);
         if (g_variant_lookup (ud, "webgl_vendor",   "&s", &s) && s) P.webgl_vendor   = g_strdup (s);
         if (g_variant_lookup (ud, "webgl_renderer", "&s", &s) && s) P.webgl_renderer = g_strdup (s);
+        if (g_variant_lookup (ud, "productSub",     "&s", &s) && s) P.product_sub    = g_strdup (s);
+        if (g_variant_lookup (ud, "oscpu",          "&s", &s) && s) P.oscpu          = g_strdup (s);
+        if (g_variant_lookup (ud, "buildID",        "&s", &s) && s) P.build_id       = g_strdup (s);
         if (g_variant_lookup (ud, "coherence",      "&s", &s) && s) P.coherence      = g_strdup (s);
         if (g_variant_lookup (ud, "boot",           "&s", &s) && s) EVWK_BOOT = g_strdup (s);
         GVariant *langs = g_variant_lookup_value (ud, "languages", G_VARIANT_TYPE ("as"));
@@ -1698,6 +1720,8 @@ void webkit_web_process_extension_initialize_with_user_data (WebKitWebProcessExt
         if (g_variant_lookup (ud, "deviceMemory",        "d", &d)) { P.has_devmem=TRUE; P.devmem=d; }
         if (g_variant_lookup (ud, "maxTouchPoints",      "d", &d)) { P.has_touch=TRUE;  P.touch=d; }
         if (g_variant_lookup (ud, "devicePixelRatio",    "d", &d)) { P.has_dpr=TRUE;    P.dpr=d; }
+        if (g_variant_lookup (ud, "mozInnerScreenX",     "d", &d)) { P.has_misx=TRUE;   P.misx=d; }
+        if (g_variant_lookup (ud, "mozInnerScreenY",     "d", &d)) { P.has_misy=TRUE;   P.misy=d; }
         if (g_variant_lookup (ud, "screen_width",        "d", &d)) { P.has_sw=TRUE; P.sw=d; }
         if (g_variant_lookup (ud, "screen_height",       "d", &d)) { P.has_sh=TRUE; P.sh=d; }
         if (g_variant_lookup (ud, "screen_availWidth",   "d", &d)) { P.has_aw=TRUE; P.aw=d; }

@@ -1,6 +1,6 @@
 package EV::WebKit;
 use v5.10; use strict; use warnings;
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 use Glib::Object::Introspection;
 use Glib::IO;   # Gio bindings: Cancellable, MemoryInputStream
@@ -4080,7 +4080,7 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
 
 {
     package EV::WebKit::UserContent;
-    our $VERSION = '0.02';
+    our $VERSION = '0.03';
     # Handle for one injected user script or stylesheet. Holds a WEAK ref to the
     # browser (so a dangling handle never keeps the instance alive) plus the id
     # of its native in the browser's per-kind registry. remove() is idempotent:
@@ -4107,7 +4107,7 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
 
 {
     package EV::WebKit::Dialog;
-    our $VERSION = '0.02';
+    our $VERSION = '0.03';
     # lightweight wrapper around a WebKitScriptDialog, valid only for the
     # duration of the script-dialog signal handler that receives it.
     sub _new    { bless { d => $_[1] }, $_[0] }
@@ -4138,7 +4138,7 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
 
 {
     package EV::WebKit::FileChooser;
-    our $VERSION = '0.02';
+    our $VERSION = '0.03';
     # lightweight wrapper around a WebKitFileChooserRequest, valid only for the
     # duration of the run-file-chooser handler that receives it.
     sub _new { bless { r => $_[1] }, $_[0] }
@@ -4172,7 +4172,7 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
 
 {
     package EV::WebKit::Auth;
-    our $VERSION = '0.02';
+    our $VERSION = '0.03';
     # A WebKitAuthenticationRequest, valid only for the duration of the
     # on_authenticate handler that receives it.
     sub _new { bless { r => $_[1] }, $_[0] }
@@ -4214,7 +4214,7 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
 
 {
     package EV::WebKit::Download;
-    our $VERSION = '0.02';
+    our $VERSION = '0.03';
     # A download in progress. Unlike Dialog/FileChooser this OUTLIVES the signal
     # that created it: WebKit reports progress and completion later, so the
     # object is retained by the browser until it finishes or fails.
@@ -4383,7 +4383,7 @@ sub DESTROY { my $self = shift; $self->{_destroying} = 1; eval { $self->quit } }
 
 {
     package EV::WebKit::Policy;
-    our $VERSION = '0.02';
+    our $VERSION = '0.03';
     # lightweight wrapper around a WebKit(Navigation|Response)PolicyDecision,
     # valid only for the duration of the decide-policy signal handler that
     # receives it.
@@ -4707,12 +4707,27 @@ are present; check L</fingerprint_available>. Note: if the extension is present
 but fails to load inside the web process (an arch/symbol mismatch), the profile's
 User-Agent is still applied while the JS-property spoof is not -- an incoherent
 state the module cannot detect from the UI process. B<Coverage:> C<navigator>
-(platform, vendor, languages, hardwareConcurrency, deviceMemory, maxTouchPoints),
-C<screen>, C<devicePixelRatio>, and the WebGL GPU vendor/renderer strings. The
+(platform, vendor, languages, hardwareConcurrency, deviceMemory, maxTouchPoints,
+and for a Gecko profile productSub, oscpu and buildID), C<screen>,
+C<devicePixelRatio>, C<window.mozInnerScreenX>/C<Y>, and the WebGL GPU
+vendor/renderer strings. The
 navigator/screen getters are installed natively, on the prototype and
 enumerable, so they read as the engine's own to everything except
 C<Function.prototype.toString> -- see the Ceiling below, which is where the
 remaining tells are enumerated honestly.
+
+C<windows-firefox> asks more of this than the others. The engine really is
+WebKit, so a Safari profile is a small lie and a Chrome one a larger one, but
+claiming Gecko means supplying a surface no WebKit build has: C<productSub>
+(Gecko reports C<20100101> where WebKit and Chromium report C<20030107>),
+C<oscpu> and C<buildID>, which exist in no other engine and whose ABSENCE
+identifies the engine as surely as a wrong value, and
+C<window.mozInnerScreenX>/C<Y>. Those are supplied. What is not, and cannot be
+without the engine, is CSS: C<CSS.supports('-moz-appearance', 'none')> is false
+here and true in Firefox, and no property override fixes that without breaking
+the styling it claims to support. Use C<windows-firefox> for the network-layer
+identity -- where it is exact -- and expect a determined JS-layer engine probe
+to see through it.
 
 A B<coherence layer> fills the gaps a bare navigator/screen spoof would leave: a
 Chrome profile also gets C<window.chrome> and a working C<navigator.userAgentData>
@@ -4901,9 +4916,13 @@ layer too. Requires C<fingerprint>. It spins an in-process L<Proxy::Impersonate>
 on this instance's EV loop and routes the browser through it: the proxy
 terminates WebKit's TLS locally and re-originates each request as the matching
 real browser via C<libcurl-impersonate>. The curl target is derived from the
-profile (C<windows-chrome> -> C<chrome131>, C<macos-safari> -> C<safari18_0>,
-C<iphone-safari> -> C<safari18_0_ios>, C<pixel-chrome> -> C<chrome131_android>);
-pass a string to override it.
+profile (C<windows-chrome> -> C<chrome150>, C<macos-safari> -> C<safari26_0>,
+C<iphone-safari> -> C<safari26_0_ios>, C<windows-firefox> -> C<firefox147>,
+C<pixel-chrome> -> C<chrome131_android>); pass a string to override it.
+
+C<pixel-chrome> stays on Chrome 131 where the others track current stable,
+because C<chrome131_android> is the newest Android target C<libcurl-impersonate>
+ships and a profile must not claim a browser its TLS cannot back.
 
 The profile's identity headers (User-Agent + C<Sec-CH-UA>) are forced over the
 curl target's defaults, so even a Windows profile is coherent on the (macOS-built)

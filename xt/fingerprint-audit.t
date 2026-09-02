@@ -39,15 +39,19 @@ sub visit {
 }
 
 my %EXPECT = (
-    'windows-chrome' => { platform => 'Win32',       family => 'chrome' },
-    'macos-safari'   => { platform => 'MacIntel',    family => 'safari' },
-    'iphone-safari'  => { platform => 'iPhone',      family => 'safari' },
-    'pixel-chrome'   => { platform => 'Linux armv8l',family => 'chrome' },
+    'windows-chrome'  => { platform => 'Win32',        family => 'chrome'  },
+    'macos-safari'    => { platform => 'MacIntel',     family => 'safari'  },
+    'iphone-safari'   => { platform => 'iPhone',       family => 'safari'  },
+    'pixel-chrome'    => { platform => 'Linux armv8l', family => 'chrome'  },
+    'windows-firefox' => { platform => 'Win32',        family => 'firefox' },
 );
-# Chrome and Safari differ in the first SETTINGS id they send, which is the
-# cheapest stable way to tell the two H2 fingerprints apart without pinning a
-# whole string that upstream curl-impersonate may re-tune.
-my %H2_HEAD = (chrome => qr/^1:65536/, safari => qr/^2:0/);
+# The families differ in the SETTINGS frame they open with, which is the
+# cheapest stable way to tell the H2 fingerprints apart without pinning a whole
+# string that upstream curl-impersonate may re-tune. Chrome and Firefox both
+# start at 1:65536, so Firefox is told apart by its INITIAL_WINDOW_SIZE.
+my %H2_HEAD = (chrome  => qr/^1:65536;2:0;4:6291456/,
+               safari  => qr/^2:0/,
+               firefox => qr/^1:65536;2:0;4:131072/);
 
 for my $prof (sort keys %EXPECT) {
     my $b = eval {
