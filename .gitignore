@@ -11,6 +11,7 @@
 *.so
 /.superpowers/
 .tmp/
+/.pcg/
 
 # Internal adversarial-review findings: kept locally, never published --
 # they enumerate live detection vectors against this module.
